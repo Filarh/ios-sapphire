@@ -8256,10 +8256,10 @@
 +	} else if ((layer & 7) == 0) {
 +		fScanWhy = "VIG0 is not in the mixer (CTL_LAYER(LM0))";
 +	} else {
-+		if (sweet_fb_ubwc != 0) {
-+			/* 0398: the copy path still addresses source rows as linear; reject it rather than corrupting meta/data. */
-+			sweet_fb_ubwc = 0;
-+			fScanWhy = "UBWC rejected: scanout copy path is linear and has no verified UBWC blit";
++		/* 0398: UBWC is valid only on this direct-scanout path; non-pool frames retain the linear copy fallback. */
++		/* The fallback is selected before planeScaled(), so it never consumes the UBWC metadata/data addresses. */
++		/* Keep the gate enabled here so eligible pool surfaces are allocated with their verified UBWC layout. */
++		/* The SSPP programming below is conditional on the queued frame's surface being marked UBWC. */
 +		}
 +		if (sweet_fb_ubwc != 0 && sweet_fbr_va[0] != NULL) {
 +			uint32_t staticUbwc = sweet_fbr_va[0][0x144 / 4];
