@@ -1,0 +1,56 @@
+sapphire: going back to a flip buffer gives the plane its linear format registers back
+
+0403 restores the plane's linear registers (SRC2_ADDR, YSTRIDE1, SRC_FORMAT, UNPACK, OP_MODE, UBWC_STATIC_CTRL,
+FETCH_CONFIG) when a linear frame of a surface follows UBWC ones. A frame of the copy path goes the other way, through
+planeUnscaled(), which restores only the geometry and the scaler: the plane read the linear flip buffer as UBWC. Seen on
+the phone after a while at rest, with the pool full and frames of surfaces outside it copied: SRC0 0x5c000000, stride
+4320, SRC_FORMAT 0x800237ff, unpack 0x03010002, UBWC_STATIC_CTRL 0x121 -- lines over the screen. planeUnscaled() now
+restores them too; the saved registers and the plane's state move to file scope, shared by both paths.
+
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 7d8d339..3fa7cfe 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -3261,6 +3261,15 @@ sweet_plane_wait(AppleCLCD *fb)
+ 	}
+ }
+ 
++/*
++ * 0410: the plane's linear registers as they were at its first UBWC flip (0403), and whether it is in UBWC now. The
++ * flip buffers of the copy path are linear: going back to them (planeUnscaled) must give these back too, or the panel
++ * decodes a linear buffer as UBWC (seen on the phone: SRC0 the flip buffer 0x5c000000, SRC_FORMAT 0x800237ff, lines).
++ */
++static bool sweet_ubwc_plane;
++static uint32_t sweet_ubwc_linear[7];             /* SRC2_ADDR, YSTRIDE1, FORMAT, UNPACK, OP_MODE, UBWC_STATIC_CTRL, FETCH */
++static const uint16_t sweet_ubwc_linear_off[7] = { 0x1c, 0x28, 0x30, 0x34, 0x38, 0x44, 0x48 };
++
+ /* Back to the plane the bootloader set up (unscaled, the panel's size), before a flip of a flip buffer. */
+ void
+ AppleCLCD::planeUnscaled(void)
+@@ -3272,6 +3281,12 @@ AppleCLCD::planeUnscaled(void)
+ 	for (unsigned k = 0; k < SWEET_PLANE_REGS; k++) {
+ 		fVig0[sweet_plane_off[k] / 4] = fPlane0[k];
+ 	}
++	if (sweet_ubwc_plane) {
++		for (unsigned k = 0; k < 7; k++) {
++			fVig0[sweet_ubwc_linear_off[k] / 4] = sweet_ubwc_linear[k];
++		}
++		sweet_ubwc_plane = false;
++	}
+ 	fPlaneScaled = false;
+ 	sweet_fbs.to_unscaled++;
+ }
+@@ -3313,9 +3328,9 @@ AppleCLCD::planeScaled(uint64_t pa, uint32_t stride, const struct SweetGeo *g, c
+ 	 * apart) and the decoder flagged nearly every frame. A linear frame after UBWC ones gets the plane's linear
+ 	 * registers back, as they were at the first UBWC flip.
+ 	 */
+-	static bool ubwcPlane;
+-	static uint32_t linear[7];                      /* SRC2_ADDR, YSTRIDE1, FORMAT, UNPACK, OP_MODE, UBWC_STATIC_CTRL, FETCH */
+-	static const uint16_t linearOff[7] = { 0x1c, 0x28, 0x30, 0x34, 0x38, 0x44, 0x48 };
++	bool &ubwcPlane = sweet_ubwc_plane;
++	uint32_t *linear = sweet_ubwc_linear;
++	const uint16_t *linearOff = sweet_ubwc_linear_off;
+ 	if (sweet_fb_ubwc != 0 && q != NULL && q->ubwc) {
+ 		if (!ubwcPlane) {
+ 			for (unsigned k = 0; k < 7; k++) {
