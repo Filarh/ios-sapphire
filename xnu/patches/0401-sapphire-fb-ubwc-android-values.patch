@@ -1,0 +1,71 @@
+sapphire: the display's UBWC registers take the values the phone's Android writes, settable at run time
+
+With the device tree's values (SSPP_UBWC_STATIC_CTRL bank field 1, FETCH_CONFIG bank 1, MDSS UBWC_STATIC 0x11f) the
+plane flagged UBWC_ERROR_STATUS 0x00ff0001 on 398 of 399 flips and the screen showed green blocks, while the GPU wrote
+real UBWC data. The phone's Android, read with sde_reg on slot b while it composed UBWC planes (modifier
+0x0500000000000001), writes VIG0 and DMA0 SSPP_UBWC_STATIC_CTRL = 0x121 and SSPP_FETCH_CONFIG = 0x00080087: bank field
+2, swizzle bit 1, bit 8, no alpha bit. Its GPU runs at highest bank bit 14 (KGSL_PROP_HIGHEST_BANK_BIT = 14,
+MIN_ACCESS_LENGTH = 64, UBWC_MODE = 1), what kern.sweet_gpu_ubwc=1 programs. So the display's bank field is not the
+device tree's sde-highest-bank-bit; the driver there writes 2.
+
+These become kern.sweet_fb_ubwc_sspp_static, kern.sweet_fb_ubwc_fetch and kern.sweet_fb_ubwc_mdss_static (the last
+not readable through sde_reg on Android: the device tree's 0x11f until it is measured), applied on every UBWC flip.
+
+---
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -508,6 +508,16 @@
+ static int sweet_fb_ubwc = 0;                    /* 0398: disabled unless direct scanout and GPU mode 1 */
+ static uint64_t sweet_fb_ubwc_flips, sweet_fb_ubwc_errors;
+ static uint32_t sweet_fb_ubwc_last_error;
++/*
++ * 0401: what the plane and the MDSS are given for UBWC, as the phone's Android programs them (read with sde_reg on
++ * slot b while it composed UBWC planes, GPU at highest bank bit 14 by KGSL_PROP_HIGHEST_BANK_BIT): VIG0 and DMA0
++ * SSPP_UBWC_STATIC_CTRL 0x121 (swizzle bit 1, bank field 2, bit 8, no alpha bit), SSPP_FETCH_CONFIG 0x87 | 2 << 18.
++ * The device tree's sde-highest-bank-bit (1) is not what its driver writes. MDSS UBWC_STATIC is not readable there
++ * through sde_reg; it stays the device tree's 0x11f until measured. All three can be set at run time to compare.
++ */
++static uint32_t sweet_fb_ubwc_sspp_static = 0x121u;
++static uint32_t sweet_fb_ubwc_fetch = 0x00080087u;
++static uint32_t sweet_fb_ubwc_mdss_static = 0x11fu;
+ static bool sweet_fb_scan_ready;                /* start() found the plane as it should be and set up the pool */
+ extern "C" int sapphire_gpu_ubwc_mode(void);
+ /*
+@@ -3296,8 +3306,11 @@
+ 		fVig0[0x28 / 4] = q->metaStride;              /* SSPP_SRC_YSTRIDE1: RGB UBWC metadata pitch */
+ 		fVig0[0x30 / 4] = fPlaneFormat | 0x80000000u; /* MDP_FETCH_UBWC(2) */
+ 		fVig0[0x38 / 4] = fPlane0[26] | 0x80000001u; /* PE_OVERRIDE | BWC_EN */
+-		fVig0[0x48 / 4] = 0x00040087u;               /* reset 0x87, DPU HBB 1 */
+-		fVig0[0x44 / 4] = 0x80000111u;               /* alpha, UBWC1, swizzle 7, HBB 1 */
++		fVig0[0x48 / 4] = sweet_fb_ubwc_fetch;        /* 0401: SSPP_FETCH_CONFIG as Android writes it */
++		fVig0[0x44 / 4] = sweet_fb_ubwc_sspp_static;  /* 0401: SSPP_UBWC_STATIC_CTRL as Android writes it */
++		if (sweet_fbr_va[0] != NULL && sweet_fbr_va[0][0x144 / 4] != sweet_fb_ubwc_mdss_static) {
++			sweet_fbr_va[0][0x144 / 4] = sweet_fb_ubwc_mdss_static;
++		}
+ 		/*
+ 		 * 0399: UBWC_ERROR_STATUS holds what the fetch met since it was last cleared: read it before clearing it, so a
+ 		 * flip reports the frames shown since the previous one. An error is counted, not acted on: turning the gate
+@@ -4650,8 +4663,8 @@
+ 	 * sm6115_data, msm_mdss_setup_ubwc_dec_20). scanoutInit() only writes it at boot, where the gate is refused,
+ 	 * so a gate opened here found it 0 and the planes decoded with swizzle 0.
+ 	 */
+-	if (v == 1 && sweet_fbr_va[0] != NULL && sweet_fbr_va[0][0x144 / 4] != 0x11fu) {
+-		sweet_fbr_va[0][0x144 / 4] = 0x11fu;
++	if (v == 1 && sweet_fbr_va[0] != NULL && sweet_fbr_va[0][0x144 / 4] != sweet_fb_ubwc_mdss_static) {
++		sweet_fbr_va[0][0x144 / 4] = sweet_fb_ubwc_mdss_static;
+ 		__asm__ volatile("dsb sy" ::: "memory");
+ 	}
+ 	sweet_fb_ubwc = v;
+@@ -4675,6 +4688,12 @@
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_ubwc_diag, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     NULL, 0, sweet_fb_ubwc_diag_sysctl, "A", "sapphire 0398: SSPP UBWC error status sampled per flip");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_ubwc_sspp_static, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_ubwc_sspp_static, 0,
++    "sapphire 0401: VIG0 SSPP_UBWC_STATIC_CTRL for UBWC frames (Android: 0x121)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_ubwc_fetch, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_ubwc_fetch, 0,
++    "sapphire 0401: VIG0 SSPP_FETCH_CONFIG for UBWC frames (Android: 0x80087)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_ubwc_mdss_static, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_ubwc_mdss_static, 0,
++    "sapphire 0401: MDSS UBWC_STATIC written before UBWC frames (device tree: 0x11f)");
+ 
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_flush_taken, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_flush_taken, 0,
+     "sapphire 0352: 1 = a flip is taken when CTL_FLUSH's bits read clear (once they are seen to read back), for every flip; 0 = by the frame counter, as 0340");
