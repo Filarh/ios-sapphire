@@ -1,0 +1,42 @@
+sapphire: only the window server's framebuffers are laid out UBWC in the scanout pool
+
+The pool takes every screen-sized BGRA surface backboardd makes, and 0398-0405 laid all of them out UBWC. Among them
+are "CA Asynchronous Page" surfaces, which CoreAnimation draws with the processor: linear rows written over a UBWC
+layout, read as noise by the GPU and, when shown, by the panel (seen on the phone: lines over a clean screen, the pool
+8 of 8 with two such surfaces). The UBWC layout is now given only to a surface created with IOSurfaceName
+"CA Framebuffer"; the others stay linear in their slots. The pool's log line names the surface and says UBWC.
+
+---
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index ae10601..d7859b8 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1034,7 +1034,15 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		/* 0350: one of the window server's screen surfaces, from the framebuffer's scanout pool */
+ 		static uint32_t pool_told;
+ 		int slot = sweet_pool_alloc_slot();
+-		(void)sweet_pool_ubwc_layout(s);       /* 0398: remains linear when the gate is not valid */
++		/*
++		 * 0406: UBWC for the window server's framebuffers alone (IOSurfaceName "CA Framebuffer", given at creation). The
++		 * pool also takes its other screen-sized surfaces -- "CA Asynchronous Page", which CoreAnimation draws with the
++		 * processor -- and the processor writes linear rows: laid out UBWC, the panel and the GPU read them as noise.
++		 */
++		OSString *poolName = OSDynamicCast(OSString, props->getObject("IOSurfaceName"));
++		if (poolName != NULL && poolName->isEqualTo("CA Framebuffer")) {
++			(void)sweet_pool_ubwc_layout(s);       /* 0398: remains linear when the gate is not valid */
++		}
+ 		uint64_t pa = slot >= 0 ? sweet_pool_pa + (uint64_t)slot * sweet_pool_slot_size : 0;
+ 		IOMemoryDescriptor *pmem = slot >= 0 ? IOMemoryDescriptor::withPhysicalAddress(pa, s->allocSize, kIODirectionInOut) : NULL;
+ 		if (pmem != NULL) {
+@@ -1070,8 +1078,9 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			sweet_pool_refused++;
+ 		}
+ 		if (pool_told++ < 12) {
+-			IOLog("SWEET SURF: scanout pool: surface %u %ux%u bpr %u %s (%u of %u slots in use)\n", s->id, s->width, s->height,
+-			    s->bytesPerRow, slot >= 0 ? "in a slot" : "not in the pool (full)", (uint32_t)__builtin_popcount(sweet_pool_used),
++			IOLog("SWEET SURF: scanout pool: surface %u \"%s\" %ux%u bpr %u%s %s (%u of %u slots in use)\n", s->id,
++			    poolName != NULL ? poolName->getCStringNoCopy() : "", s->width, s->height, s->bytesPerRow, s->ubwc ? " UBWC" : "",
++			    slot >= 0 ? "in a slot" : "not in the pool (full)", (uint32_t)__builtin_popcount(sweet_pool_used),
+ 			    sweet_pool_slots);
+ 		}
+ 	}
