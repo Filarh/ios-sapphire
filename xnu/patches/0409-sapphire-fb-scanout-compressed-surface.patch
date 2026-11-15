@@ -1,0 +1,23 @@
+sapphire: a '&BGA' framebuffer in the pool is scanned out directly
+
+With 0408 the window server's framebuffers are '&BGA' and UBWC in the pool, but the scanout's test of a frame took
+BGRA alone, so every frame went to the copy path as "unfit" (read on the phone: unfit 544, flips 0) -- a copy that reads
+the surface as linear rows. A '&BGA' surface the kernel laid out UBWC is now fit, and its frames are shown from its
+layout as 0398-0405 do.
+
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index dba531d..7d8d339 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -3449,7 +3449,9 @@ AppleCLCD::presentScanout(const uint8_t *rec, SweetSurface **held, bool *queued)
+ 	if (!s->lowPool || s->scanoutPhys == 0) {
+ 		sweet_fbs.not_pool++;
+ 		why = 1;
+-	} else if (s->width != fLogicalW || s->height != fLogicalH || s->pixelFormat != SWEET_FB_FMT_BGRA ||
++	/* 0409: a '&BGA' surface (lossless BGRA, asked for by its creator) is scanned out from its UBWC layout */
++	} else if (s->width != fLogicalW || s->height != fLogicalH ||
++	    !(s->pixelFormat == SWEET_FB_FMT_BGRA || (s->pixelFormat == 0x26424741 && s->ubwc)) ||
+ 	    s->bytesPerElement != 4 || (s->bytesPerRow & 63) != 0 || s->bytesPerRow > 0xffff || s->offset != 0 || g.sw == 0 ||
+ 	    g.sh == 0 || g.sx + g.sw > s->width || g.sy + g.sh > s->height ||
+ 	    s->scanoutPhys + (uint64_t)s->bytesPerRow * s->height > (1ull << 32)) {
