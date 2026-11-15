@@ -1,0 +1,131 @@
+sapphire: a pool surface stays UBWC if the GPU takes it first, and turns linear if the processor does
+
+0406 kept UBWC for surfaces named "CA Framebuffer" at creation, but CoreAnimation names its surfaces after creation
+(IOSurfaceSetValue): every surface stayed linear (0 UBWC flips). The pool takes all of backboardd's screen-sized BGRA
+surfaces, and "CA Asynchronous Page" ones are drawn by the processor in linear rows; laid out UBWC they read as lines
+of noise on the panel and to the GPU. Each pool surface is now UBWC until it is first taken: the GPU client's surface
+request settles it UBWC, a processor lock (trapLock) settles it linear -- offset 0 and the bytes a row its creator was
+given, so the processor's rows are where it believes them. The pool's description says each slot's layout.
+
+---
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index 0e5c51d..987b890 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -6787,6 +6787,7 @@ SapphireGPUClient::surface(struct msm_surface *r)
+ 	r->height = s->height;
+ 	r->pixelFormat = s->pixelFormat;
+ 	r->planes = s->planeCount;
++	sweet_surface_ubwc_settle(s, true);     /* 0407: the GPU first keeps a pool surface UBWC */
+ 	r->ubwc = s->ubwc ? 1 : 0;
+ 	r->metaOffset = s->ubwcMetaOffset;
+ 	r->metaStride = s->ubwcMetaStride;
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index d7859b8..0edcd74 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -199,7 +199,7 @@ sweet_scanout_free_slot(int slot)
+ static uint64_t sweet_pool_pa;
+ static uint32_t sweet_pool_slots, sweet_pool_slot_size, sweet_pool_w, sweet_pool_h;
+ static uint32_t sweet_pool_used;                /* bit per slot, sweet_surface_lock */
+-static uint64_t sweet_pool_made, sweet_pool_refused;
++static uint64_t sweet_pool_made, sweet_pool_refused, sweet_pool_ubwc_to_linear;   /* 0407: surfaces the processor took first */
+ static SweetSurface *sweet_pool_owner[32];      /* 0354: the surface in each slot (not retained), sweet_surface_lock */
+ extern "C" int sweet_fb_ubwc_on(void);
+ extern "C" int sapphire_gpu_ubwc_mode(void);
+@@ -237,6 +237,28 @@ sweet_pool_eligible(const SweetSurface *s)
+ 	return strcmp(who, "backboardd") == 0;
+ }
+ 
++/*
++ * 0407: who reaches a tentatively UBWC pool surface first decides its layout for good: the GPU (gpu true, from the GPU
++ * client's surface request) keeps it UBWC; the processor (a lock) makes it linear.
++ */
++extern "C" void
++sweet_surface_ubwc_settle(SweetSurface *s, bool gpu)
++{
++	if (s == NULL || sweet_surface_lock == NULL) {
++		return;
++	}
++	IOLockLock(sweet_surface_lock);
++	if (s->ubwc && !s->ubwcSettled) {
++		if (!gpu) {
++			s->ubwc = false;
++			s->ubwcMetaOffset = s->ubwcMetaStride = s->ubwcMetaSize = s->ubwcDataOffset = s->ubwcDataStride = 0;
++			sweet_pool_ubwc_to_linear++;
++		}
++		s->ubwcSettled = true;
++	}
++	IOLockUnlock(sweet_surface_lock);
++}
++
+ static bool
+ sweet_pool_ubwc_layout(SweetSurface *s)
+ {
+@@ -331,8 +353,9 @@ sweet_scanout_pool_describe(char *buf, size_t len)
+ 		if (s->swapAbs != 0) {
+ 			absolutetime_to_nanoseconds(now - s->swapAbs, &swap_ns);
+ 		}
+-		int n = snprintf(buf + off, len - off, "  slot %u: surface %u \"%s\" by %s, made %llu s ago, swapped %u times%s",
+-		    i, s->id, name != NULL ? name->getCStringNoCopy() : "", s->creator, age_ns / NSEC_PER_SEC, s->swaps,
++		int n = snprintf(buf + off, len - off, "  slot %u: surface %u \"%s\" by %s, %s, made %llu s ago, swapped %u times%s",
++		    i, s->id, name != NULL ? name->getCStringNoCopy() : "", s->creator,
++		    s->ubwc ? (s->ubwcSettled ? "UBWC" : "UBWC until taken") : "linear", age_ns / NSEC_PER_SEC, s->swaps,
+ 		    s->swapAbs != 0 ? ", last " : "\n");
+ 		if (n > 0) {
+ 			off = off + (size_t)n < len ? off + (size_t)n : len - 1;
+@@ -1035,14 +1058,13 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		static uint32_t pool_told;
+ 		int slot = sweet_pool_alloc_slot();
+ 		/*
+-		 * 0406: UBWC for the window server's framebuffers alone (IOSurfaceName "CA Framebuffer", given at creation). The
+-		 * pool also takes its other screen-sized surfaces -- "CA Asynchronous Page", which CoreAnimation draws with the
+-		 * processor -- and the processor writes linear rows: laid out UBWC, the panel and the GPU read them as noise.
++		 * 0407: laid out UBWC until the processor locks it before the GPU has taken it (trapLock): the pool also takes
++		 * backboardd's other screen-sized surfaces, "CA Asynchronous Page" among them, which CoreAnimation draws with the
++		 * processor in linear rows. (Their name comes after creation, by IOSurfaceSetValue: 0406's test of it at
++		 * creation found none and left every surface linear.)
+ 		 */
+ 		OSString *poolName = OSDynamicCast(OSString, props->getObject("IOSurfaceName"));
+-		if (poolName != NULL && poolName->isEqualTo("CA Framebuffer")) {
+-			(void)sweet_pool_ubwc_layout(s);       /* 0398: remains linear when the gate is not valid */
+-		}
++		(void)sweet_pool_ubwc_layout(s);       /* 0398: remains linear when the gate is not valid */
+ 		uint64_t pa = slot >= 0 ? sweet_pool_pa + (uint64_t)slot * sweet_pool_slot_size : 0;
+ 		IOMemoryDescriptor *pmem = slot >= 0 ? IOMemoryDescriptor::withPhysicalAddress(pa, s->allocSize, kIODirectionInOut) : NULL;
+ 		if (pmem != NULL) {
+@@ -1696,6 +1718,9 @@ IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	/* 0407: the processor first: a pool surface still tentatively UBWC becomes linear (its rows as the creator was told:
++	 * offset 0, the same bytes a row), so the GPU and the panel read what the processor writes */
++	sweet_surface_ubwc_settle(s, false);
+ 	/* 0394: what the GPU wrote, waited for and out of the processor's caches before the lock is held (IOSurfaceLock
+ 	 * waits for the GPU's writes unless kIOSurfaceLockAvoidSync says not to) */
+ 	sapphire_gpu_surface_settle(s, ((uintptr_t)options & kIOSurfaceLockAvoidSync) != 0);
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 69747a5..34fa9c1 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -87,10 +87,11 @@ public:
+ 	uint64_t                  swapAbs;
+ 	/* 0398: shared display UBWC layout; only pool surfaces may set this. */
+ 	bool                      ubwc;
++	bool                      ubwcSettled;             /* 0407: the GPU or the processor has taken it */
+ 	uint32_t                  ubwcMetaOffset, ubwcMetaStride, ubwcMetaSize;
+ 	uint32_t                  ubwcDataOffset, ubwcDataStride;
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { sweet_surface_counted(1); gpuSeed = 0; gpuDrawn = false; cpuEpoch = 1; cleanEpoch = 0; invalEpoch = 0; scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; lowPool = false; gpuFence = 0; gpuWriteFence = 0; settledFence = 0; creator[0] = 0; madeAbs = 0; swaps = 0; swapAbs = 0; ubwc = false; ubwcMetaOffset = ubwcMetaStride = ubwcMetaSize = ubwcDataOffset = ubwcDataStride = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { sweet_surface_counted(1); gpuSeed = 0; gpuDrawn = false; cpuEpoch = 1; cleanEpoch = 0; invalEpoch = 0; scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; lowPool = false; gpuFence = 0; gpuWriteFence = 0; settledFence = 0; creator[0] = 0; madeAbs = 0; swaps = 0; swapAbs = 0; ubwc = false; ubwcSettled = false; ubwcMetaOffset = ubwcMetaStride = ubwcMetaSize = ubwcDataOffset = ubwcDataStride = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+@@ -139,5 +140,7 @@ void sapphire_gpu_surface_settle(SweetSurface *s, bool avoidSync);
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
++extern "C" void sweet_surface_ubwc_settle(SweetSurface *s, bool gpu);   /* 0407: GPU or processor first */
+ #endif /* SWEET */
++
+ #endif /* _SWEET_SURFACE_H */
