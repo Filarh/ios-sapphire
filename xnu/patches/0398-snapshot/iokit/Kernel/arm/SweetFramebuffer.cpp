@@ -1292,11 +1292,8 @@ AppleCLCD::scanoutInit(void)
 	} else if ((layer & 7) == 0) {
 		fScanWhy = "VIG0 is not in the mixer (CTL_LAYER(LM0))";
 	} else {
-		if (sweet_fb_ubwc != 0) {
-			/* 0398: the copy path still addresses source rows as linear; reject it rather than corrupting meta/data. */
-			sweet_fb_ubwc = 0;
-			fScanWhy = "UBWC rejected: scanout copy path is linear and has no verified UBWC blit";
-		}
+		/* 0398: UBWC is valid only on this direct-scanout path. The copy fallback remains linear because
+		 * scanoutOn() selects it whenever a frame is not a pool surface; it never enters planeScaled(). */
 		if (sweet_fb_ubwc != 0 && sweet_fbr_va[0] != NULL) {
 			uint32_t staticUbwc = sweet_fbr_va[0][0x144 / 4];
 			if (staticUbwc != 0x11fu) {
