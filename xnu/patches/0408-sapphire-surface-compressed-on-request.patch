@@ -1,0 +1,68 @@
+sapphire: a surface is compressed when its creator asks for it, as iOS does
+
+iOS compresses an IOSurface because its creator asks before IOSurfaceCreate, through the format and the planes'
+compression (QuartzCore, CA::SurfaceUtil::CAIOSurfaceCreate in 20H392); the name comes afterwards by IOSurfaceSetValue,
+and no first access decides anything. QuartzCore asks for its framebuffers in '&BGA' once CADeviceUseCompression holds:
+on this port the ChipID table refuses it by default (0x8015) and the CAEnableIOSurfaceCompression preference of
+com.apple.backboardd lets it through, as the code reads it after the table. Read on the phone with it set: the
+"CA Framebuffer" surfaces come '&BGA', the "CA Asynchronous Page" ones BGRA.
+
+The scanout pool takes '&BGA' as well as BGRA, and lays a surface out UBWC only when it is '&BGA'; everything asked for
+linear stays linear (0406's name test and 0407's settling by first access no longer apply). A UBWC surface's plane 0
+says so where IOSurface.framework reads it: compression type 2 (QuartzCore's AGX plane description, without universal
+compression) at IOSurfaceClient + 0x124, the headers' and data regions' offsets at + 0x10c / + 0x110.
+
+---
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 0edcd74..243846a 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -229,7 +229,7 @@ sweet_pool_eligible(const SweetSurface *s)
+ 	char who[32];
+ 
+ 	if (sweet_pool_slots == 0 || !sweet_fb_scanout_pool_on() || s->width != sweet_pool_w || s->height != sweet_pool_h ||
+-	    s->pixelFormat != 0x42475241 || s->bytesPerElement != 4 || s->planeCount > 1 || s->elementWidth != 1 ||
++	    (s->pixelFormat != 0x42475241 && s->pixelFormat != 0x26424741) || s->bytesPerElement != 4 || s->planeCount > 1 || s->elementWidth != 1 ||
+ 	    s->elementHeight != 1 || s->offset != 0 || (s->bytesPerRow & 63) != 0 || s->allocSize > sweet_pool_slot_size) {
+ 		return false;
+ 	}
+@@ -929,6 +929,17 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+ 		p[0x1a] = pl->elementWidth;
+ 		p[0x1b] = pl->elementHeight;
++		if (i == 0 && s->ubwc) {
++			/*
++			 * 0408: the plane as compressed, where IOSurface.framework reads it (IOSurfaceClient + 0x124 + plane * 0x80 for
++			 * IOSurfaceGetCompressionTypeOfPlane; the compressed-tile header and data regions' offsets at + 0x10c / + 0x110):
++			 * type 2, the one QuartzCore's AGX plane description gives without universal compression. Its metadata (the
++			 * headers) at the start, the data after them, in UBWC's layout.
++			 */
++			p[0x54] = 2;
++			put32(p, 0x3c, s->ubwcMetaOffset);
++			put32(p, 0x40, s->ubwcDataOffset);
++		}
+ 	}
+ }
+ 
+@@ -1058,13 +1069,16 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		static uint32_t pool_told;
+ 		int slot = sweet_pool_alloc_slot();
+ 		/*
+-		 * 0407: laid out UBWC until the processor locks it before the GPU has taken it (trapLock): the pool also takes
+-		 * backboardd's other screen-sized surfaces, "CA Asynchronous Page" among them, which CoreAnimation draws with the
+-		 * processor in linear rows. (Their name comes after creation, by IOSurfaceSetValue: 0406's test of it at
+-		 * creation found none and left every surface linear.)
++		 * 0408: compressed when its creator asked for it, as iOS does: QuartzCore asks before IOSurfaceCreate, through the
++		 * format -- '&BGA', lossless BGRA, for its framebuffers once CADeviceUseCompression holds (the ChipID table, then
++		 * the CAEnableIOSurfaceCompression preference) -- and the planes' compression. Every surface asked for linear
++		 * stays linear: no name, process or first access decides it.
+ 		 */
+ 		OSString *poolName = OSDynamicCast(OSString, props->getObject("IOSurfaceName"));
+-		(void)sweet_pool_ubwc_layout(s);       /* 0398: remains linear when the gate is not valid */
++		if (s->pixelFormat == 0x26424741) {
++			(void)sweet_pool_ubwc_layout(s);       /* 0398: remains linear when the gate is not valid */
++		}
++		s->ubwcSettled = true;                 /* (0407's settling by first access does not apply) */
+ 		uint64_t pa = slot >= 0 ? sweet_pool_pa + (uint64_t)slot * sweet_pool_slot_size : 0;
+ 		IOMemoryDescriptor *pmem = slot >= 0 ? IOMemoryDescriptor::withPhysicalAddress(pa, s->allocSize, kIODirectionInOut) : NULL;
+ 		if (pmem != NULL) {
