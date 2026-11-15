@@ -6,6 +6,8 @@ name: xnu-4k
 
 on:
   workflow_dispatch:
+  push:
+    branches: ['ci/**']
 
 concurrency:
   group: xnu-4k-${{ github.ref }}
