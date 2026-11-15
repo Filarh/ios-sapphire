@@ -1,0 +1,66 @@
+sapphire: the display's UBWC pool is on from boot, with the GPU's tiled channel order
+
+Measured with the driver drawing the window server's framebuffer in UBWC (its framebuffer fetch, views and the 2D
+engine's copies and fills now read and write the layout): the panel shows it clean, and over the same gesture (n=3,
+9 s each) the queue flips 53/s linear and 65/s UBWC, the GPU busy about 91 % and 72 % of the time.
+
+Defaults change: kern.sweet_gpu_ubwc 1 (kgsl's values, bank bit 14), kern.sweet_fb_scanout 1 and kern.sweet_fb_ubwc
+1, so the pool's surfaces are made UBWC from the window server's first frame; boot-args gpu_ubwc=0, sweetfb_scanout=0
+and sweetfb_ubwc=0 turn each off, as the sysctls do. kern.sweet_fb_ubwc_unpack defaults to 0x03010002: in TILE6_3 the
+GPU keeps the components in WZYX order whatever the texture's format (Mesa fd6_pipe2swap: the CCU ignores the swap
+when tiled), so a BGRA surface is R,G,B,A in memory and the plane reads it with the unpack of the phone's Android for
+UBWC ABGR8888; with the BGRA pattern red and blue were swapped. scanoutInit() no longer refuses UBWC at boot: a frame
+of the copy path is linear and planeScaled() restores the plane's linear registers for it (0403).
+
+---
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index 5e5432c..0e5c51d 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -2124,7 +2124,7 @@ hwcg_set(bool on)
+  * restart its owner (killall backboardd) after a write. kern.sweet_gpu_ubwc_regs: the five registers as they read now,
+  * and as they were found. GET_PARAM HIGHEST_BANK_BIT answers the bank bit in force (14 with gpu_ubwc 0, as before).
+  */
+-static int gpu_ubwc;                            /* boot-arg gpu_ubwc, kern.sweet_gpu_ubwc */
++static int gpu_ubwc = 1;                        /* boot-arg gpu_ubwc, kern.sweet_gpu_ubwc; 0405: kgsl's values by default */
+ 
+ extern "C" int
+ sapphire_gpu_ubwc_mode(void)
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index c53261c..dba531d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -504,8 +504,8 @@ sweet_fbl_sample(volatile uint32_t *ctl, volatile uint32_t *intf)
+ #define SWEET_FB_SCAN_SLOTS     8
+ #define SWEET_FB_SCAN_SLOT      0x00500000u
+ #define SWEET_FB_FMT_BGRA       0x42475241
+-static int sweet_fb_scanout = 0;
+-static int sweet_fb_ubwc = 0;                    /* 0398: disabled unless direct scanout and GPU mode 1 */
++static int sweet_fb_scanout = 1;                /* 0405: on by default (boot-arg sweetfb_scanout=0 turns it off) */
++static int sweet_fb_ubwc = 1;                    /* 0405: on by default with direct scanout and a GPU UBWC mode (sweetfb_ubwc=0: off) */
+ static uint64_t sweet_fb_ubwc_flips, sweet_fb_ubwc_errors;
+ static uint32_t sweet_fb_ubwc_last_error;
+ /*
+@@ -525,7 +525,7 @@ static uint32_t sweet_fb_ubwc_mdss_static = 0x11fu;
+  * the value found at the first UBWC flip). kern.sweet_fb_ubwc_nocrop=1 writes SRC_XY 0 on UBWC flips, as Android
+  * shows its UBWC buffers from 0,0 (the picture then moves by the crop).
+  */
+-static uint32_t sweet_fb_ubwc_unpack, sweet_fb_ubwc_unpack_found;
++static uint32_t sweet_fb_ubwc_unpack = 0x03010002u, sweet_fb_ubwc_unpack_found;   /* 0405: the GPU's tiled order, R,G,B,A (WZYX) */
+ static uint32_t sweet_fb_ubwc_nocrop;
+ static bool sweet_fb_scan_ready;                /* start() found the plane as it should be and set up the pool */
+ extern "C" int sapphire_gpu_ubwc_mode(void);
+@@ -1311,11 +1311,8 @@ AppleCLCD::scanoutInit(void)
+ 	} else if ((layer & 7) == 0) {
+ 		fScanWhy = "VIG0 is not in the mixer (CTL_LAYER(LM0))";
+ 	} else {
+-		if (sweet_fb_ubwc != 0) {
+-			/* 0398: the copy path still addresses source rows as linear; reject it rather than corrupting meta/data. */
+-			sweet_fb_ubwc = 0;
+-			fScanWhy = "UBWC rejected: scanout copy path is linear and has no verified UBWC blit";
+-		}
++		/* 0405: a frame the copy path shows is linear, and planeScaled() gives the plane its linear registers back for
++		 * it (0403), so the gate stays open from boot */
+ 		if (sweet_fb_ubwc != 0 && sweet_fbr_va[0] != NULL) {
+ 			uint32_t staticUbwc = sweet_fbr_va[0][0x144 / 4];
+ 			if (staticUbwc != 0x11fu) {
