@@ -1,5 +1,5 @@
---- a/iokit/Kernel/arm/SweetSurface.h	2026-11-15 03:31:44
-+++ b/iokit/Kernel/arm/SweetSurface.h	2026-11-15 03:29:06
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
 @@ -85,8 +85,12 @@
  	uint64_t                  madeAbs;
  	uint32_t                  swaps;
@@ -14,8 +14,8 @@
  	void free() APPLE_KEXT_OVERRIDE;
  
  	/* Kernel address of the pixels (mapped on first use), or 0. */
---- a/iokit/Kernel/arm/SweetSurface.cpp	2026-11-15 03:31:44
-+++ b/iokit/Kernel/arm/SweetSurface.cpp	2026-11-15 03:29:06
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
 @@ -201,6 +201,8 @@
  static uint32_t sweet_pool_used;                /* bit per slot, sweet_surface_lock */
  static uint64_t sweet_pool_made, sweet_pool_refused;
@@ -67,8 +67,8 @@
  		uint64_t pa = slot >= 0 ? sweet_pool_pa + (uint64_t)slot * sweet_pool_slot_size : 0;
  		IOMemoryDescriptor *pmem = slot >= 0 ? IOMemoryDescriptor::withPhysicalAddress(pa, s->allocSize, kIODirectionInOut) : NULL;
  		if (pmem != NULL) {
---- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-15 03:31:44
-+++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-15 03:30:19
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -505,7 +505,11 @@
  #define SWEET_FB_SCAN_SLOT      0x00500000u
  #define SWEET_FB_FMT_BGRA       0x42475241
@@ -231,8 +231,8 @@
  SYSCTL_INT(_kern, OID_AUTO, sweet_fb_flush_taken, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_flush_taken, 0,
      "sapphire 0352: 1 = a flip is taken when CTL_FLUSH's bits read clear (once they are seen to read back), for every flip; 0 = by the frame counter, as 0340");
  
---- a/iokit/Kernel/arm/SapphireGpu.cpp	2026-11-15 03:31:44
-+++ b/iokit/Kernel/arm/SapphireGpu.cpp	2026-11-15 03:29:06
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
 @@ -2125,6 +2125,12 @@
   * and as they were found. GET_PARAM HIGHEST_BANK_BIT answers the bank bit in force (14 with gpu_ubwc 0, as before).
   */
@@ -267,3 +267,4 @@
  	if (r->handle == MSM_DESCRIBE) {
  		r->handle = 0;
  		s->release();
+
