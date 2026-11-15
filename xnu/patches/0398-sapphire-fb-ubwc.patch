@@ -1,0 +1,269 @@
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -2125,6 +2125,12 @@
+  * and as they were found. GET_PARAM HIGHEST_BANK_BIT answers the bank bit in force (14 with gpu_ubwc 0, as before).
+  */
+ static int gpu_ubwc;                            /* boot-arg gpu_ubwc, kern.sweet_gpu_ubwc */
++
++extern "C" int
++sapphire_gpu_ubwc_mode(void)
++{
++	return gpu_ubwc;
++}
+ static bool ubwc_found_ok;                      /* the values hw_init_regs found before it first wrote any */
+ static uint32_t ubwc_found[5];
+ 
+@@ -4383,6 +4389,7 @@
+ 	uint64_t size;
+ 	uint32_t offset, rowBytes;              /* where the pixels start in the buffer, a row's length */
+ 	uint32_t width, height, pixelFormat, planes;
++	uint32_t ubwc, metaOffset, metaStride, metaSize, dataOffset, dataStride;
+ };
+ 
+ #define MSM_INFO_GET_OFFSET 0
+@@ -6780,6 +6787,12 @@
+ 	r->height = s->height;
+ 	r->pixelFormat = s->pixelFormat;
+ 	r->planes = s->planeCount;
++	r->ubwc = s->ubwc ? 1 : 0;
++	r->metaOffset = s->ubwcMetaOffset;
++	r->metaStride = s->ubwcMetaStride;
++	r->metaSize = s->ubwcMetaSize;
++	r->dataOffset = s->ubwcDataOffset;
++	r->dataStride = s->ubwcDataStride;
+ 	if (r->handle == MSM_DESCRIBE) {
+ 		r->handle = 0;
+ 		s->release();
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -505,7 +505,11 @@
+ #define SWEET_FB_SCAN_SLOT      0x00500000u
+ #define SWEET_FB_FMT_BGRA       0x42475241
+ static int sweet_fb_scanout = 0;
++static int sweet_fb_ubwc = 0;                    /* 0398: disabled unless direct scanout and GPU mode 1 */
++static uint64_t sweet_fb_ubwc_flips, sweet_fb_ubwc_errors;
++static uint32_t sweet_fb_ubwc_last_error;
+ static bool sweet_fb_scan_ready;                /* start() found the plane as it should be and set up the pool */
++extern "C" int sapphire_gpu_ubwc_mode(void);
+ /*
+  * sapphire 0352: when a flip counts as taken (flipTaken()). CTL_FLUSH holds the bits a flip writes until the MDP takes
+  * them, as Linux and the stock driver read it (dpu_encoder_phys_vid.c, sde_encoder_phys_vid.c, vblank): measured on the
+@@ -804,6 +808,9 @@
+ 		bool          scan;
+ 		SweetSurface *surf;
+ 		uint32_t      stride;
++		uint32_t      metaStride;
++		uint64_t      metaPa;
++		bool          ubwc;
+ 		struct SweetGeo geo;
+ 		uint32_t      swap;           /* 0353: the id of the swap it shows (0: none, the timer's or an adopted copy) */
+ 		uint32_t      ox, oy;         /* 0354: a frame of a surface: the window's origin, in pa already */
+@@ -1254,8 +1261,13 @@
+ AppleCLCD::scanoutInit(void)
+ {
+ 	PE_parse_boot_argn("sweetfb_scanout", &sweet_fb_scanout, sizeof(sweet_fb_scanout));
++	PE_parse_boot_argn("sweetfb_ubwc", &sweet_fb_ubwc, sizeof(sweet_fb_ubwc));
+ 	PE_parse_boot_argn("sweetfb_flush_taken", &sweet_fb_flush_taken, sizeof(sweet_fb_flush_taken));     /* 0352 */
+ 	PE_parse_boot_argn("sweetfb_swapwait", &sweet_fb_swapwait, sizeof(sweet_fb_swapwait));             /* 0353 */
++	if (sweet_fb_ubwc != 0 && (sweet_fb_ubwc != 1 || sweet_fb_scanout != 1 || sapphire_gpu_ubwc_mode() != 1)) {
++		sweet_fb_ubwc = 0;
++		fScanWhy = "UBWC requires sweetfb_scanout=1 and kern.sweet_gpu_ubwc=1";
++	}
+ 	if (fVig0 == NULL || fCtl0 == NULL) {
+ 		fScanWhy = "the plane is not mapped";
+ 		return;
+@@ -1280,6 +1292,18 @@
+ 	} else if ((layer & 7) == 0) {
+ 		fScanWhy = "VIG0 is not in the mixer (CTL_LAYER(LM0))";
+ 	} else {
++		if (sweet_fb_ubwc != 0) {
++			/* 0398: the copy path still addresses source rows as linear; reject it rather than corrupting meta/data. */
++			sweet_fb_ubwc = 0;
++			fScanWhy = "UBWC rejected: scanout copy path is linear and has no verified UBWC blit";
++		}
++		if (sweet_fb_ubwc != 0 && sweet_fbr_va[0] != NULL) {
++			uint32_t staticUbwc = sweet_fbr_va[0][0x144 / 4];
++			if (staticUbwc != 0x11fu) {
++				sweet_fbr_va[0][0x144 / 4] = 0x11fu;
++				__asm__ volatile("dsb sy" ::: "memory");
++			}
++		}
+ 		sweet_scanout_pool_set(SWEET_FB_SCAN_PA, SWEET_FB_SCAN_SLOTS, SWEET_FB_SCAN_SLOT, fLogicalW, fLogicalH);
+ 		sweet_fb_scan_ready = true;
+ 	}
+@@ -3266,6 +3290,22 @@
+ 	scanoutLeave();
+ 	fVig0[0x14 / 4] = (uint32_t)pa;
+ 	fVig0[0x24 / 4] = stride;
++	if (sweet_fb_ubwc != 0 && fQCount != 0 && fQ[fQCount - 1].ubwc) {
++		struct SweetQFrame *q = &fQ[fQCount - 1];
++		fVig0[0x1c / 4] = (uint32_t)q->metaPa;
++		fVig0[0x28 / 4] = q->metaStride;              /* SSPP_SRC_YSTRIDE1: RGB UBWC metadata pitch */
++		fVig0[0x30 / 4] = fPlaneFormat | 0x80000000u; /* MDP_FETCH_UBWC(2) */
++		fVig0[0x38 / 4] = fPlane0[26] | 0x80000001u; /* PE_OVERRIDE | BWC_EN */
++		fVig0[0x48 / 4] = 0x00040087u;               /* reset 0x87, DPU HBB 1 */
++		fVig0[0x44 / 4] = 0x80000111u;               /* alpha, UBWC1, swizzle 7, HBB 1 */
++		fVig0[0x138 / 4] = 0x80000000u;
++		sweet_fb_ubwc_flips++;
++		sweet_fb_ubwc_last_error = fVig0[0x138 / 4];
++		if (sweet_fb_ubwc_last_error != 0) {
++			sweet_fb_ubwc_errors++;
++			sweet_fb_ubwc = 0;
++		}
++	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	fCtl0[0x18 / 4] = 0x20001;      /* flush VIG0 + CTL: latched at the next frame start */
+ 	__asm__ volatile("dsb sy" ::: "memory");
+@@ -3462,13 +3502,23 @@
+ 	 * fetches from a 16-byte aligned address) -- and only what is left into SRC_XY: with the panel's window at 16, 12 of
+ 	 * the 2x picture (fOffX, start()), nothing. The copy crops the same way (blit_scale(), SapphireGpu.cpp).
+ 	 */
+-	uint32_t ax = g.sx & ~3u;
+-	f->pa = s->scanoutPhys + (uint64_t)g.sy * s->bytesPerRow + (uint64_t)ax * 4;
+-	f->ox = g.sx;
+-	f->oy = g.sy;
+-	g.sx -= ax;
+-	g.sy = 0;
+-	f->stride = s->bytesPerRow;
++		f->ubwc = s->ubwc;
++		if (s->ubwc) {
++			/* UBWC crops stay in SRC_XY; the compressed data is not row-addressable. */
++			f->pa = s->scanoutPhys + s->ubwcDataOffset;
++			f->metaPa = s->scanoutPhys + s->ubwcMetaOffset;
++			f->metaStride = s->ubwcMetaStride;
++			f->ox = g.sx;
++			f->oy = g.sy;
++		} else {
++			uint32_t ax = g.sx & ~3u;
++			f->pa = s->scanoutPhys + (uint64_t)g.sy * s->bytesPerRow + (uint64_t)ax * 4;
++			f->ox = g.sx;
++			f->oy = g.sy;
++			g.sx -= ax;
++			g.sy = 0;
++		}
++		f->stride = s->ubwc ? s->ubwcDataStride : s->bytesPerRow;
+ 	f->geo = g;
+ 	f->fence = sapphire_gpu_msm_fence();
+ 	f->queued = mach_absolute_time();
+@@ -4565,6 +4615,52 @@
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_scanout_diag, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     NULL, 0, sweet_fb_scanout_diag_sysctl, "A", "sapphire 0350: the scanout's state and counters");
++
++extern "C" int
++sweet_fb_ubwc_on(void)
++{
++	return sweet_fb_ubwc != 0 && sweet_fb_scanout == 1 && sapphire_gpu_ubwc_mode() == 1 && sweet_fb_scan_ready;
++}
++
++static int
++sweet_fb_ubwc_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = sweet_fb_ubwc;
++	int error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (v != 0 && v != 1) {
++		return EINVAL;
++	}
++	if (v != 0 && (sweet_fb_scanout != 1 || sapphire_gpu_ubwc_mode() != 1 || sweet_frame_fb == NULL || !sweet_fb_scan_ready)) {
++		return EINVAL;
++	}
++	/* Existing pool surfaces cannot change layout in place; a disable stops direct scanout before copy resumes. */
++	int was = sweet_fb_ubwc;
++	sweet_fb_ubwc = v;
++	if (was != 0 && v == 0 && sweet_frame_fb != NULL) {
++		sweet_frame_fb->scanoutStop();
++	}
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_ubwc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sweet_fb_ubwc_sysctl, "I", "sapphire 0398: 1 = shared UBWC display pool (GPU mode 1 and direct scanout only), 0 = linear");
++
++static int
++sweet_fb_ubwc_diag_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char line[192];
++	snprintf(line, sizeof(line), "ubwc %d flips %llu errors %llu last %#x mdss_static %#x gpu_mode %d\n", sweet_fb_ubwc,
++	    sweet_fb_ubwc_flips, sweet_fb_ubwc_errors, sweet_fb_ubwc_last_error,
++	    sweet_fbr_va[0] != NULL ? sweet_fbr_va[0][0x144 / 4] : 0, sapphire_gpu_ubwc_mode());
++	return SYSCTL_OUT(req, line, strlen(line) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_ubwc_diag, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_fb_ubwc_diag_sysctl, "A", "sapphire 0398: SSPP UBWC error status sampled per flip");
++
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_flush_taken, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_flush_taken, 0,
+     "sapphire 0352: 1 = a flip is taken when CTL_FLUSH's bits read clear (once they are seen to read back), for every flip; 0 = by the frame counter, as 0340");
+ 
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -201,6 +201,8 @@
+ static uint32_t sweet_pool_used;                /* bit per slot, sweet_surface_lock */
+ static uint64_t sweet_pool_made, sweet_pool_refused;
+ static SweetSurface *sweet_pool_owner[32];      /* 0354: the surface in each slot (not retained), sweet_surface_lock */
++extern "C" int sweet_fb_ubwc_on(void);
++extern "C" int sapphire_gpu_ubwc_mode(void);
+ 
+ void
+ sweet_scanout_pool_set(uint64_t pa, uint32_t slots, uint32_t slot_size, uint32_t width, uint32_t height)
+@@ -233,6 +235,33 @@
+ 	}
+ 	proc_selfname(who, sizeof(who));
+ 	return strcmp(who, "backboardd") == 0;
++}
++
++static bool
++sweet_pool_ubwc_layout(SweetSurface *s)
++{
++	uint32_t metaStride = ((s->width + 15) / 16 + 63) & ~63u;
++	uint32_t metaLines = (((s->height + 3) / 4) + 15) & ~15u;
++	uint32_t metaSize = (metaStride * metaLines + 4095) & ~4095u;
++	uint32_t dataStride = (s->width * 4 + 255) & ~255u;
++	uint32_t dataLines = (s->height + 15) & ~15u;
++	uint32_t total = metaSize + dataStride * dataLines;
++	if (!sweet_fb_ubwc_on() || sapphire_gpu_ubwc_mode() != 1 || total > sweet_pool_slot_size ||
++	    (sweet_pool_pa & 4095) != 0) {
++		return false;
++	}
++	s->ubwc = true;
++	s->ubwcMetaOffset = 0;
++	s->ubwcMetaStride = metaStride;
++	s->ubwcMetaSize = metaSize;
++	s->ubwcDataOffset = metaSize;
++	s->ubwcDataStride = dataStride;
++	s->allocSize = total;
++	s->bytesPerRow = dataStride;
++	s->planes[0].bytesPerRow = dataStride;
++	s->planes[0].offset = metaSize;
++	s->planes[0].size = dataStride * dataLines;
++	return true;
+ }
+ 
+ static int
+@@ -1005,6 +1034,7 @@
+ 		/* 0350: one of the window server's screen surfaces, from the framebuffer's scanout pool */
+ 		static uint32_t pool_told;
+ 		int slot = sweet_pool_alloc_slot();
++		(void)sweet_pool_ubwc_layout(s);       /* 0398: remains linear when the gate is not valid */
+ 		uint64_t pa = slot >= 0 ? sweet_pool_pa + (uint64_t)slot * sweet_pool_slot_size : 0;
+ 		IOMemoryDescriptor *pmem = slot >= 0 ? IOMemoryDescriptor::withPhysicalAddress(pa, s->allocSize, kIODirectionInOut) : NULL;
+ 		if (pmem != NULL) {
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -85,8 +85,12 @@
+ 	uint64_t                  madeAbs;
+ 	uint32_t                  swaps;
+ 	uint64_t                  swapAbs;
++	/* 0398: shared display UBWC layout; only pool surfaces may set this. */
++	bool                      ubwc;
++	uint32_t                  ubwcMetaOffset, ubwcMetaStride, ubwcMetaSize;
++	uint32_t                  ubwcDataOffset, ubwcDataStride;
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { sweet_surface_counted(1); gpuSeed = 0; gpuDrawn = false; cpuEpoch = 1; cleanEpoch = 0; invalEpoch = 0; scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; lowPool = false; gpuFence = 0; gpuWriteFence = 0; settledFence = 0; creator[0] = 0; madeAbs = 0; swaps = 0; swapAbs = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { sweet_surface_counted(1); gpuSeed = 0; gpuDrawn = false; cpuEpoch = 1; cleanEpoch = 0; invalEpoch = 0; scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; lowPool = false; gpuFence = 0; gpuWriteFence = 0; settledFence = 0; creator[0] = 0; madeAbs = 0; swaps = 0; swapAbs = 0; ubwc = false; ubwcMetaOffset = ubwcMetaStride = ubwcMetaSize = ubwcDataOffset = ubwcDataStride = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
