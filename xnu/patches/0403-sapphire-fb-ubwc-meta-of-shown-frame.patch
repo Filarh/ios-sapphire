@@ -1,0 +1,91 @@
+sapphire: a UBWC flip takes the metadata of the frame it shows
+
+0398 programmed SSPP_SRC2_ADDR and YSTRIDE1 from fQ[fQCount - 1], the newest frame still queued. The frame being shown
+has already left the queue when planeScaled() runs (queueStep() and queueDrain() take it out first), so the plane
+fetched one surface's colour data with another surface's metadata, or, with the queue empty, kept the metadata of an
+earlier frame. Read on the phone: SRC0_ADDR e5007000 with SRC2_ADDR e5a00000 (pool slots are 0x500000 apart), and
+UBWC_ERROR_STATUS set on 9 of 10 flips, the screen covered in green blocks. planeScaled() now receives the frame and
+uses its own metaPa, metaStride and ubwc flag.
+
+A linear frame after UBWC ones restores the plane's linear registers (SRC2_ADDR, YSTRIDE1, SRC_FORMAT, UNPACK,
+OP_MODE, UBWC_STATIC_CTRL, FETCH_CONFIG, as found at the first UBWC flip, and SRC_XY): 0398 left them in UBWC mode.
+
+---
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -874,7 +874,7 @@
+ 	void          scanoutRetire(void);
+ 	void          scanoutStop(void);
+ 	bool          planeWritable(void);
+-	void          planeScaled(uint64_t pa, uint32_t stride, const struct SweetGeo *g);
++	void          planeScaled(uint64_t pa, uint32_t stride, const struct SweetGeo *g, const struct SweetQFrame *q = NULL);
+ 	void          planeUnscaled(void);
+ 	void          flipNote(uint64_t pa, bool force);
+ 	bool          frameDone(const struct SweetQFrame *f, uint64_t now);
+@@ -3286,7 +3286,7 @@
+  * bits read clear right after it mean that the register does not read back.
+  */
+ void
+-AppleCLCD::planeScaled(uint64_t pa, uint32_t stride, const struct SweetGeo *g)
++AppleCLCD::planeScaled(uint64_t pa, uint32_t stride, const struct SweetGeo *g, const struct SweetQFrame *q)
+ {
+ 	bool geometry = !fPlaneScaled || memcmp(g, &fPlaneGeo, sizeof(*g)) != 0;
+ 
+@@ -3309,17 +3309,30 @@
+ 	scanoutLeave();
+ 	fVig0[0x14 / 4] = (uint32_t)pa;
+ 	fVig0[0x24 / 4] = stride;
+-	if (sweet_fb_ubwc != 0 && fQCount != 0 && fQ[fQCount - 1].ubwc) {
+-		struct SweetQFrame *q = &fQ[fQCount - 1];
++	/*
++	 * 0403: the metadata is the shown frame's. 0398 took it from fQ[fQCount - 1], the newest frame still queued, but
++	 * the frame shown has already left the queue when it comes here (queueStep(), queueDrain()): the plane fetched one
++	 * surface's data with another's metadata (read on the phone: SRC0 e5007000 with SRC2 e5a00000, slots 0x500000
++	 * apart) and the decoder flagged nearly every frame. A linear frame after UBWC ones gets the plane's linear
++	 * registers back, as they were at the first UBWC flip.
++	 */
++	static bool ubwcPlane;
++	static uint32_t linear[7];                      /* SRC2_ADDR, YSTRIDE1, FORMAT, UNPACK, OP_MODE, UBWC_STATIC_CTRL, FETCH */
++	static const uint16_t linearOff[7] = { 0x1c, 0x28, 0x30, 0x34, 0x38, 0x44, 0x48 };
++	if (sweet_fb_ubwc != 0 && q != NULL && q->ubwc) {
++		if (!ubwcPlane) {
++			for (unsigned k = 0; k < 7; k++) {
++				linear[k] = fVig0[linearOff[k] / 4];
++			}
++			sweet_fb_ubwc_unpack_found = linear[3];
++			ubwcPlane = true;
++		}
+ 		fVig0[0x1c / 4] = (uint32_t)q->metaPa;
+ 		fVig0[0x28 / 4] = q->metaStride;              /* SSPP_SRC_YSTRIDE1: RGB UBWC metadata pitch */
+ 		fVig0[0x30 / 4] = fPlaneFormat | 0x80000000u; /* MDP_FETCH_UBWC(2) */
+ 		fVig0[0x38 / 4] = fPlane0[26] | 0x80000001u; /* PE_OVERRIDE | BWC_EN */
+ 		fVig0[0x48 / 4] = sweet_fb_ubwc_fetch;        /* 0401: SSPP_FETCH_CONFIG as Android writes it */
+ 		fVig0[0x44 / 4] = sweet_fb_ubwc_sspp_static;  /* 0401: SSPP_UBWC_STATIC_CTRL as Android writes it */
+-		if (sweet_fb_ubwc_unpack_found == 0) {
+-			sweet_fb_ubwc_unpack_found = fVig0[0x34 / 4];
+-		}
+ 		fVig0[0x34 / 4] = sweet_fb_ubwc_unpack != 0 ? sweet_fb_ubwc_unpack : sweet_fb_ubwc_unpack_found;   /* 0402 */
+ 		if (sweet_fb_ubwc_nocrop != 0) {
+ 			fVig0[0x08 / 4] = 0;                  /* 0402: SRC_XY */
+@@ -3339,6 +3352,12 @@
+ 			sweet_fb_ubwc_last_error = ubwcStatus;
+ 			sweet_fb_ubwc_errors++;
+ 		}
++	} else if (ubwcPlane) {
++		for (unsigned k = 0; k < 7; k++) {
++			fVig0[linearOff[k] / 4] = linear[k];
++		}
++		fVig0[0x08 / 4] = (g->sy << 16) | g->sx;       /* SRC_XY, in case 0402's nocrop cleared it */
++		ubwcPlane = false;
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	fCtl0[0x18 / 4] = 0x20001;      /* flush VIG0 + CTL: latched at the next frame start */
+@@ -3384,7 +3403,7 @@
+ 		if (last != 0 && (int32_t)(last - f->fence) > 0) {
+ 			sweet_fbs.late_draw++;          /* drawn by a submission made after its SwapEnd */
+ 		}
+-		planeScaled(f->pa, f->stride, &f->geo);
++		planeScaled(f->pa, f->stride, &f->geo, f);
+ 		fPlaneOX = f->ox;                       /* 0354 */
+ 		fPlaneOY = f->oy;
+ 		memcpy(fScanShow, f->held, sizeof(fScanShow));
