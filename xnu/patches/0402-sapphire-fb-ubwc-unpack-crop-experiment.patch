@@ -1,0 +1,53 @@
+sapphire: experiment switches for the display's UBWC frames: the unpack pattern and the crop
+
+With the MDSS, plane and GPU UBWC registers equal to the phone's Android (0401) the plane still flags
+UBWC_ERROR_STATUS on nearly every flip. Two differences are left in how the surface is shown: the phone's display
+driver lists UBWC only for R,G,B,A in memory (sde_formats.c, sde_format_map_ubwc: ABGR8888 and XBGR8888, unpack
+0x03010002) while the window server's surfaces are B,G,R,A (0x03020001); and Android shows its UBWC buffers from
+SRC_XY 0,0 while this plane crops 16,12. kern.sweet_fb_ubwc_unpack and kern.sweet_fb_ubwc_nocrop change each on UBWC
+flips, to tell which one the decoder objects to.
+
+---
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -518,6 +518,15 @@
+ static uint32_t sweet_fb_ubwc_sspp_static = 0x121u;
+ static uint32_t sweet_fb_ubwc_fetch = 0x00080087u;
+ static uint32_t sweet_fb_ubwc_mdss_static = 0x11fu;
++/*
++ * 0402 (experiment): the phone's display driver lists UBWC only for R,G,B,A in memory (sde_formats.c
++ * sde_format_map_ubwc: ABGR8888/XBGR8888, unpack 0x03010002); the window server's surfaces are B,G,R,A (unpack
++ * 0x03020001). kern.sweet_fb_ubwc_unpack, when not 0, is written to SSPP_SRC_UNPACK_PATTERN on UBWC flips (0 restores
++ * the value found at the first UBWC flip). kern.sweet_fb_ubwc_nocrop=1 writes SRC_XY 0 on UBWC flips, as Android
++ * shows its UBWC buffers from 0,0 (the picture then moves by the crop).
++ */
++static uint32_t sweet_fb_ubwc_unpack, sweet_fb_ubwc_unpack_found;
++static uint32_t sweet_fb_ubwc_nocrop;
+ static bool sweet_fb_scan_ready;                /* start() found the plane as it should be and set up the pool */
+ extern "C" int sapphire_gpu_ubwc_mode(void);
+ /*
+@@ -3308,6 +3317,13 @@
+ 		fVig0[0x38 / 4] = fPlane0[26] | 0x80000001u; /* PE_OVERRIDE | BWC_EN */
+ 		fVig0[0x48 / 4] = sweet_fb_ubwc_fetch;        /* 0401: SSPP_FETCH_CONFIG as Android writes it */
+ 		fVig0[0x44 / 4] = sweet_fb_ubwc_sspp_static;  /* 0401: SSPP_UBWC_STATIC_CTRL as Android writes it */
++		if (sweet_fb_ubwc_unpack_found == 0) {
++			sweet_fb_ubwc_unpack_found = fVig0[0x34 / 4];
++		}
++		fVig0[0x34 / 4] = sweet_fb_ubwc_unpack != 0 ? sweet_fb_ubwc_unpack : sweet_fb_ubwc_unpack_found;   /* 0402 */
++		if (sweet_fb_ubwc_nocrop != 0) {
++			fVig0[0x08 / 4] = 0;                  /* 0402: SRC_XY */
++		}
+ 		if (sweet_fbr_va[0] != NULL && sweet_fbr_va[0][0x144 / 4] != sweet_fb_ubwc_mdss_static) {
+ 			sweet_fbr_va[0][0x144 / 4] = sweet_fb_ubwc_mdss_static;
+ 		}
+@@ -4694,6 +4710,10 @@
+     "sapphire 0401: VIG0 SSPP_FETCH_CONFIG for UBWC frames (Android: 0x80087)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_ubwc_mdss_static, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_ubwc_mdss_static, 0,
+     "sapphire 0401: MDSS UBWC_STATIC written before UBWC frames (device tree: 0x11f)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_ubwc_unpack, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_ubwc_unpack, 0,
++    "sapphire 0402: SSPP_SRC_UNPACK_PATTERN on UBWC flips when not 0 (Android's UBWC ABGR8888: 0x03010002)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_ubwc_nocrop, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_ubwc_nocrop, 0,
++    "sapphire 0402: 1 = SRC_XY 0 on UBWC flips (experiment)");
+ 
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_flush_taken, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_flush_taken, 0,
+     "sapphire 0352: 1 = a flip is taken when CTL_FLUSH's bits read clear (once they are seen to read back), for every flip; 0 = by the frame counter, as 0340");
