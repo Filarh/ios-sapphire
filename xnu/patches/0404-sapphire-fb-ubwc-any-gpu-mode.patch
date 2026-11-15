@@ -1,0 +1,53 @@
+sapphire: the display's UBWC pool takes either UBWC configuration of the GPU
+
+0398 opened kern.sweet_fb_ubwc only with kern.sweet_gpu_ubwc=1 (kgsl's values, highest bank bit 14). With mode 2
+(Linux's a6xx values for the A610: bank bit 13, RBBM_NC_MODE_CNTL written 0) the gate stays shut, so the two cannot be
+compared on the panel. The gate and the pool's UBWC layout now take any mode but 0; kern.sweet_fb_ubwc_sspp_static and
+kern.sweet_fb_ubwc_fetch (0401) set the plane's bank bit to match.
+
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6de8f4d..c53261c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1283,7 +1283,7 @@ AppleCLCD::scanoutInit(void)
+ 	PE_parse_boot_argn("sweetfb_ubwc", &sweet_fb_ubwc, sizeof(sweet_fb_ubwc));
+ 	PE_parse_boot_argn("sweetfb_flush_taken", &sweet_fb_flush_taken, sizeof(sweet_fb_flush_taken));     /* 0352 */
+ 	PE_parse_boot_argn("sweetfb_swapwait", &sweet_fb_swapwait, sizeof(sweet_fb_swapwait));             /* 0353 */
+-	if (sweet_fb_ubwc != 0 && (sweet_fb_ubwc != 1 || sweet_fb_scanout != 1 || sapphire_gpu_ubwc_mode() != 1)) {
++	if (sweet_fb_ubwc != 0 && (sweet_fb_ubwc != 1 || sweet_fb_scanout != 1 || sapphire_gpu_ubwc_mode() == 0)) {
+ 		sweet_fb_ubwc = 0;
+ 		fScanWhy = "UBWC requires sweetfb_scanout=1 and kern.sweet_gpu_ubwc=1";
+ 	}
+@@ -4672,7 +4672,7 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_scanout_diag, CTLTYPE_STRING | CTLFLAG_RD
+ extern "C" int
+ sweet_fb_ubwc_on(void)
+ {
+-	return sweet_fb_ubwc != 0 && sweet_fb_scanout == 1 && sapphire_gpu_ubwc_mode() == 1 && sweet_fb_scan_ready;
++	return sweet_fb_ubwc != 0 && sweet_fb_scanout == 1 && sapphire_gpu_ubwc_mode() != 0 && sweet_fb_scan_ready;
+ }
+ 
+ static int
+@@ -4687,7 +4687,8 @@ sweet_fb_ubwc_sysctl SYSCTL_HANDLER_ARGS
+ 	if (v != 0 && v != 1) {
+ 		return EINVAL;
+ 	}
+-	if (v != 0 && (sweet_fb_scanout != 1 || sapphire_gpu_ubwc_mode() != 1 || sweet_frame_fb == NULL || !sweet_fb_scan_ready)) {
++	/* 0404: either UBWC configuration of the GPU (1 kgsl's, bank bit 14; 2 Linux's, 13), to compare the two */
++	if (v != 0 && (sweet_fb_scanout != 1 || sapphire_gpu_ubwc_mode() == 0 || sweet_frame_fb == NULL || !sweet_fb_scan_ready)) {
+ 		return EINVAL;
+ 	}
+ 	/* Existing pool surfaces cannot change layout in place; a disable stops direct scanout before copy resumes. */
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 6b3428b..ae10601 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -246,7 +246,7 @@ sweet_pool_ubwc_layout(SweetSurface *s)
+ 	uint32_t dataStride = (s->width * 4 + 255) & ~255u;
+ 	uint32_t dataLines = (s->height + 15) & ~15u;
+ 	uint32_t total = metaSize + dataStride * dataLines;
+-	if (!sweet_fb_ubwc_on() || sapphire_gpu_ubwc_mode() != 1 || total > sweet_pool_slot_size ||
++	if (!sweet_fb_ubwc_on() || sapphire_gpu_ubwc_mode() == 0 || total > sweet_pool_slot_size ||
+ 	    (sweet_pool_pa & 4095) != 0) {
+ 		return false;
+ 	}
