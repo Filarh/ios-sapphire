@@ -1,0 +1,49 @@
+sapphire: a compressed surface is laid out UBWC only once it has a slot of the pool
+
+0408 laid a '&BGA' surface out UBWC before asking the pool for a slot. With the pool full -- CoreAnimation's compressed
+"CA Asynchronous Page" surfaces hold slots too, and after a while backboardd's new framebuffers are refused -- the
+surface was made in ordinary memory still marked UBWC: the GPU drew it compressed, and the copy path, which shows
+frames of surfaces outside the pool, read it as linear rows. Seen on the phone after more than ten minutes at rest:
+the plane linear over a copy buffer, the frames copied for surfaces outside the pool jumping from 367 to 516 on
+waking, lines on the panel. The layout is now made only for a surface that got a slot, and a surface that leaves the
+pool again (no kernel mapping) goes back to the linear geometry it was asked with.
+
+---
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 243846a..8f1af52 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1075,7 +1075,15 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		 * stays linear: no name, process or first access decides it.
+ 		 */
+ 		OSString *poolName = OSDynamicCast(OSString, props->getObject("IOSurfaceName"));
+-		if (s->pixelFormat == 0x26424741) {
++		/*
++		 * 0411: only in a slot. A surface the pool cannot take (full: CoreAnimation's compressed pages hold slots too) is
++		 * made in ordinary memory and stays linear there: laid out UBWC first and left so, the GPU drew it compressed and
++		 * the copy path read it as rows (lines on the panel after a while). Its linear geometry is kept to go back to.
++		 */
++		const uint32_t linAlloc = s->allocSize, linRow = s->bytesPerRow;
++		const uint32_t linPlaneRow = s->planes[0].bytesPerRow, linPlaneOff = s->planes[0].offset;
++		const uint32_t linPlaneSize = s->planes[0].size;
++		if (slot >= 0 && s->pixelFormat == 0x26424741) {
+ 			(void)sweet_pool_ubwc_layout(s);       /* 0398: remains linear when the gate is not valid */
+ 		}
+ 		s->ubwcSettled = true;                 /* (0407's settling by first access does not apply) */
+@@ -1112,6 +1120,16 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		}
+ 		if (slot < 0) {
+ 			sweet_pool_refused++;
++			if (s->ubwc) {
++				/* 0411: out of the pool after all (no kernel mapping): back to the linear geometry it was asked with */
++				s->ubwc = false;
++				s->ubwcMetaOffset = s->ubwcMetaStride = s->ubwcMetaSize = s->ubwcDataOffset = s->ubwcDataStride = 0;
++				s->allocSize = linAlloc;
++				s->bytesPerRow = linRow;
++				s->planes[0].bytesPerRow = linPlaneRow;
++				s->planes[0].offset = linPlaneOff;
++				s->planes[0].size = linPlaneSize;
++			}
+ 		}
+ 		if (pool_told++ < 12) {
+ 			IOLog("SWEET SURF: scanout pool: surface %u \"%s\" %ux%u bpr %u%s %s (%u of %u slots in use)\n", s->id,
