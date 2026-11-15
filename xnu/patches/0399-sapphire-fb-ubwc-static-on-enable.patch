@@ -1,0 +1,53 @@
+sapphire: UBWC_STATIC is written when the display's UBWC gate opens; UBWC_ERROR_STATUS is read before it is cleared
+
+Opening kern.sweet_fb_ubwc at run time left MDSS UBWC_STATIC (+0x144) at 0: 0398 writes it only in scanoutInit(),
+where the gate is refused at boot. The planes then decode UBWC with swizzle 0 and highest bank bit 0 while the GPU
+writes swizzle 7, bank bit 14 (read on the phone: MDSS +0x144 = 0, VIG0 UBWC_ERROR_STATUS = 0x00ff0001, a screen of
+green blocks). The value is this SoC's device tree's (qcom,sde-ubwc-static = <0x11f>) and Linux's for sm6115
+(msm_mdss.c, msm_mdss_setup_ubwc_dec_20).
+
+0398 cleared VIG0 UBWC_ERROR_STATUS (+0x138) and read it straight back, before the fetch could set it, so its error
+count stayed 0. It is now read first and cleared after, and an error is counted without closing the gate (closing it
+would leave the pool's UBWC surfaces fetched as linear).
+
+---
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -3298,12 +3298,17 @@
+ 		fVig0[0x38 / 4] = fPlane0[26] | 0x80000001u; /* PE_OVERRIDE | BWC_EN */
+ 		fVig0[0x48 / 4] = 0x00040087u;               /* reset 0x87, DPU HBB 1 */
+ 		fVig0[0x44 / 4] = 0x80000111u;               /* alpha, UBWC1, swizzle 7, HBB 1 */
++		/*
++		 * 0399: UBWC_ERROR_STATUS holds what the fetch met since it was last cleared: read it before clearing it, so a
++		 * flip reports the frames shown since the previous one. An error is counted, not acted on: turning the gate
++		 * off here would leave the pool's UBWC surfaces fetched as linear.
++		 */
++		uint32_t ubwcStatus = fVig0[0x138 / 4] & 0x7fffffffu;
+ 		fVig0[0x138 / 4] = 0x80000000u;
+ 		sweet_fb_ubwc_flips++;
+-		sweet_fb_ubwc_last_error = fVig0[0x138 / 4];
+-		if (sweet_fb_ubwc_last_error != 0) {
++		if (ubwcStatus != 0) {
++			sweet_fb_ubwc_last_error = ubwcStatus;
+ 			sweet_fb_ubwc_errors++;
+-			sweet_fb_ubwc = 0;
+ 		}
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+@@ -4639,6 +4644,16 @@
+ 	}
+ 	/* Existing pool surfaces cannot change layout in place; a disable stops direct scanout before copy resumes. */
+ 	int was = sweet_fb_ubwc;
++	/*
++	 * 0399: the decoder's global setting, MDSS UBWC_STATIC (+0x144), as this SoC's device tree gives it
++	 * (qcom,sde-ubwc-static = 0x11f, swizzle 7, highest bank bit 1, UBWC 1.0) and Linux writes it (msm_mdss.c
++	 * sm6115_data, msm_mdss_setup_ubwc_dec_20). scanoutInit() only writes it at boot, where the gate is refused,
++	 * so a gate opened here found it 0 and the planes decoded with swizzle 0.
++	 */
++	if (v == 1 && sweet_fbr_va[0] != NULL && sweet_fbr_va[0][0x144 / 4] != 0x11fu) {
++		sweet_fbr_va[0][0x144 / 4] = 0x11fu;
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
+ 	sweet_fb_ubwc = v;
+ 	if (was != 0 && v == 0 && sweet_frame_fb != NULL) {
+ 		sweet_frame_fb->scanoutStop();
