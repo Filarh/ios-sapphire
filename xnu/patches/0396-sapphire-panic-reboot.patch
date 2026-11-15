@@ -1,0 +1,51 @@
+sapphire: boot-arg sweet_panic_reboot=1 restarts into the bootloader after a panic
+
+A panic on this board spins with its text on the screen after the log ring is written to the disk, and
+only the power key gets the phone out. With sweet_panic_reboot=1 the platform expert sets the PMIC reboot
+reason to the bootloader at start, and the panic path asks PSCI for SYSTEM_RESET once the ring is on the
+disk; the ring is then read from recovery. Default 0: as before.
+---
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index cc6f033..f286b55 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -71,6 +71,14 @@ SweetPlatformExpert::start(IOService *provider)
+ 	}
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
++	/* 0396: with sweet_panic_reboot=1 a panic restarts the phone; the restart it gets then is to the bootloader */
++	{
++		int panic_reboot = 0;
++		if (PE_parse_boot_argn("sweet_panic_reboot", &panic_reboot, sizeof(panic_reboot)) && panic_reboot != 0) {
++			int rc = sweet_spmi_set_reboot_reason(2);
++			IOLog("SWEET: sweet_panic_reboot: a panic restarts into the bootloader (reason write %d)\n", rc);
++		}
++	}
+ 	/* 0323: IOResources/IONetworkStack, which configd's interface namer opens before it says "quiet" */
+ 	SweetIONetworkStackStart();
+ 	return true;
+diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
+index 99ef23a..90544d9 100644
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -813,6 +813,20 @@ SavePanicInfo(
+ 	 */
+ 	extern void sweet_log_panic_flush(void);
+ 	sweet_log_panic_flush();
++	/*
++	 * 0396: boot-arg sweet_panic_reboot=1 restarts after the ring is on the disk instead of spinning with the
++	 * panic on the screen. The PMIC reboot reason is not written here (that takes a lock that may be held):
++	 * SweetPlatformExpert::start set it to the bootloader when the boot-arg is there, so the phone comes up in
++	 * fastboot and the ring can be read from recovery.
++	 */
++	{
++		int panic_reboot = 0;
++		if (PE_parse_boot_argn("sweet_panic_reboot", &panic_reboot, sizeof(panic_reboot)) && panic_reboot != 0) {
++			register uint64_t x0 __asm__("x0") = 0x84000009ULL;     /* PSCI SYSTEM_RESET */
++			__asm__ volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10",
++			    "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++		}
++	}
+ #endif
+ 	/*
+ 	 * This should be initialized by the time we get here, but
