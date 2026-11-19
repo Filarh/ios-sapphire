@@ -1,0 +1,37 @@
+xnu 0412: AppleCLCD publishes DisplayPipePlaneBaseAlignment as a dictionary
+
+VideoToolbox (FigGetAlignmentForIOSurfaceOutputToDisplayService) reads it with
+CFDictionaryGetValue(prop, "PlaneBaseAlignmentLinear") and no type check: the number
+published since 0046 made mediaserverd abort when any AVPlayer item with video was
+prepared (AVErrorMediaServicesWereReset, -11819). Same 64-byte value.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 109ee16c8..85d6c70d2 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1249,7 +1249,24 @@ AppleCLCD::start(IOService *provider)
+ 	publishModes();
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	/*
++	 * DisplayPipePlaneBaseAlignment is a dictionary on Apple's AppleCLCD: VideoToolbox's
++	 * FigGetAlignmentForIOSurfaceOutputToDisplayService (asked by MediaToolbox for every AVPlayer video
++	 * pipeline) calls CFDictionaryGetValue(prop, "PlaneBaseAlignmentLinear") without checking the type, so
++	 * the plain number published before raised an exception in mediaserverd (SIGABRT, AVErrorMediaServices
++	 * WereReset -11819 in the app). Same value, 64 bytes, in the shape iOS reads; DisplayPipeStrideRequirements
++	 * stays unpublished (VideoToolbox then uses 64).
++	 */
++	{
++		OSDictionary *align = OSDictionary::withCapacity(1);
++		OSNumber *linear = OSNumber::withNumber(64ULL, 32);
++		if (align && linear) {
++			align->setObject("PlaneBaseAlignmentLinear", linear);
++			setProperty("DisplayPipePlaneBaseAlignment", align);
++		}
++		OSSafeReleaseNULL(linear);
++		OSSafeReleaseNULL(align);
++	}
+ 	registerService();
+ 	fStartAbs = mach_absolute_time();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
