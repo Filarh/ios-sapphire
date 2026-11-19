@@ -1,0 +1,80 @@
+xnu 0413: the AW87559 speaker amplifiers (the other sapphire lot)
+
+On this phone Android finds no FS1815 at 0x34/0x35 (I2C transfer error -107) and
+drives two Awinic AW87559 (chip id 0x5a) at 0x58/0x5b, same bus, HWEN on TLMM 105/99
+(the pins 0198 raises). iOS sound and the kernel beeps reached the codec AUX output
+but nobody turned the amplifiers on: nothing was ever heard. When neither FS1815
+answers, write Xiaomi's aw87xxx_acf.bin profile Music (N7/LQ) to both AW87559.
+---
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 399c1377c..27e15d78d 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -12437,6 +12437,55 @@ fs_init(uint8_t a, uint16_t scene_vol)
+ 	return id == 0x0003 || id == 0x0300;
+ }
+ 
++/*
++ * ---- the AW87559 amplifiers (0413). Not every sapphire has FS1815s: on this lot Android's kernel finds
++ * nothing at 0x34/0x35 (fsm_i2c_reg_read: transfer error -107) and binds aw87xxx_pa to two Awinic
++ * AW87559 (chip id 0x5a) at 0x58 and 0x5b, same I2C bus (QUP0 SE1, 4a84000), their HWEN on the same
++ * pins 0198 raises (gpio 503 = TLMM 105 for 0x58, 497 = TLMM 99 for 0x5b). They are analog-input
++ * class-K amplifiers fed by the WCD937x AUX output, so the codec path stays as it is. Registers are
++ * 8-bit, written as (reg, value). The tables are Xiaomi's /vendor/firmware/aw87xxx_acf.bin, project
++ * N7 / LQ, profile 0 "Music" (dev_index 1 = 0x58, 0 = 0x5b); they differ only in 0x07 (gain). Off is
++ * 0x01 = 0x00. Checked on Android: with profile Music both read back exactly these values.
++ */
++static const uint8_t aw_music[][2] = {
++	{ 0x62, 0xb5 }, { 0x78, 0x39 }, { 0x79, 0xe5 }, { 0x77, 0xc1 }, { 0x77, 0xc1 }, { 0x78, 0x7a },
++	{ 0x79, 0x6c }, { 0x77, 0x81 }, { 0x66, 0x69 }, { 0x58, 0xbc }, { 0x02, 0x49 }, { 0x03, 0x0a },
++	{ 0x04, 0x80 }, { 0x05, 0x08 }, { 0x06, 0x0a }, { 0x07, 0x00 }, { 0x08, 0x4e }, { 0x09, 0x0b },
++	{ 0x0a, 0x08 }, { 0x0b, 0x4b }, { 0x0c, 0x03 }, { 0x0d, 0x77 }, { 0x0e, 0x7a }, { 0x0f, 0x51 },
++	{ 0x10, 0x58 }, { 0x60, 0x26 }, { 0x61, 0x15 }, { 0x63, 0x5a }, { 0x64, 0xd5 }, { 0x65, 0x57 },
++	{ 0x67, 0x28 }, { 0x68, 0x35 }, { 0x69, 0x98 }, { 0x70, 0x1c }, { 0x71, 0x9c }, { 0x72, 0x33 },
++	{ 0x73, 0x40 }, { 0x74, 0x6c }, { 0x01, 0x78 },
++};
++
++static int
++aw_wr(uint8_t a, uint8_t reg, uint8_t v)
++{
++	uint8_t b[2] = { reg, v };
++	return sweet_i2c1_write(a, b, 2);
++}
++
++static bool
++aw_init(uint8_t a, uint8_t gain)
++{
++	uint8_t id = 0;
++	int e = sweet_i2c1_read(a, 0x00, &id, 1);
++	if (e != 0 || id != 0x5a) {
++		LOG("adsp: AW87559 0x%02x: chip id read %d -> %02x, not one", a, e, id);
++		return false;
++	}
++	int errs = 0;
++	for (unsigned i = 0; i < sizeof(aw_music) / sizeof(aw_music[0]); i++) {
++		uint8_t v = aw_music[i][0] == 0x07 ? gain : aw_music[i][1];
++		errs += aw_wr(a, aw_music[i][0], v) != 0;
++	}
++	IOSleep(2);
++	uint8_t r1 = 0, r7 = 0;
++	(void)sweet_i2c1_read(a, 0x01, &r1, 1);
++	(void)sweet_i2c1_read(a, 0x07, &r7, 1);
++	LOG("adsp: AW87559 0x%02x: Music written (%d errors), 01 %02x 07 %02x", a, errs, r1, r7);
++	return errs == 0 && r1 == 0x78;
++}
++
+ /*
+  * a_flags (kern.sweet_audio op 5): 1 the RX clocks and RX MCLK mux 1 as 0192-0195 had them (stock
+  * asks only for the TX ones: topaz-woa P9_audio.md, "root cause"), 2 without the stock RX macro
+@@ -13329,6 +13378,11 @@ audio_test(void)
+ 		IOSleep(200);
+ 		bool a = (a_flags & 8) || fs_init(0x34, 0x000b), b = (a_flags & 8) || fs_init(0x35, 0x000e);
+ 		LOG("adsp: speaker amplifiers: 0x34 %s, 0x35 %s", a ? "on" : "not found", b ? "on" : "not found");
++		if (!(a_flags & 8) && !a && !b) {
++			/* 0413: the other lot's amplifiers */
++			bool c = aw_init(0x58, 0x85), d = aw_init(0x5b, 0x88);
++			LOG("adsp: speaker amplifiers: AW87559 0x58 %s, 0x5b %s", c ? "on" : "not found", d ? "on" : "not found");
++		}
+ 		IOSleep(200);
+ 	}
+ 	unsigned sent = 0, t0 = a_ms;

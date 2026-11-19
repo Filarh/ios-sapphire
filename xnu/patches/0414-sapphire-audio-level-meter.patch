@@ -1,0 +1,81 @@
+xnu 0414: kern.sweet_audio_level, a level meter on /dev/redwood-audio
+
+"iOS sound: playing" only says frames arrive; after a seek Telegram writes silence for
+a while. Peak of the last write, highest peak since last read, ms since a sample went
+over -54 dBFS, and the ring fill: enough to time when sound (not frames) comes back.
+---
+diff --git a/bsd/dev/sweet_audio_dev.c b/bsd/dev/sweet_audio_dev.c
+index 4508e54e3..2c5fd2c4b 100644
+--- a/bsd/dev/sweet_audio_dev.c
++++ b/bsd/dev/sweet_audio_dev.c
+@@ -17,6 +17,7 @@
+ #include <sys/proc.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/clock.h>
++#include <sys/sysctl.h>
+ 
+ #define SA_RING         16384u                  /* frames, 341 ms */
+ 
+@@ -28,6 +29,15 @@ static volatile uint32_t sa_head, sa_tail;      /* frames written / taken, wrapp
+ volatile uint64_t sweet_audio_last_write;       /* mach_absolute_time() of the last write */
+ volatile uint32_t sweet_audio_vol_below, sweet_audio_vol_muted, sweet_audio_vol_gen;
+ volatile uint64_t sweet_audio_frames_in, sweet_audio_frames_dropped;
++/*
++ * 0414: a level meter on what iOS writes, to tell sound from silence (the stream's "playing" only says frames
++ * arrive): the peak of the last write, the highest peak since it was last read, and when a sample last went
++ * over SA_LOUD. kern.sweet_audio_level reads "frames peak_last peak_max loud_ms_ago ring_frames" and clears
++ * peak_max.
++ */
++#define SA_LOUD         64                      /* |sample| above this is sound (-54 dBFS) */
++static volatile uint32_t sa_peak_last, sa_peak_max;
++static volatile uint64_t sa_last_loud;
+ 
+ uint32_t sweet_audio_avail(void);
+ uint32_t sweet_audio_take(int16_t *mono, uint32_t frames);
+@@ -100,6 +110,21 @@ sa_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 			sa_ring[2 * k] = buf[2 * i];
+ 			sa_ring[2 * k + 1] = buf[2 * i + 1];
+ 		}
++		uint32_t pk = 0;
++		for (uint32_t i = 0; i < 2 * frames; i++) {
++			int32_t v = buf[i];
++			uint32_t a = (uint32_t)(v < 0 ? -v : v);
++			if (a > pk) {
++				pk = a;
++			}
++		}
++		sa_peak_last = pk;
++		if (pk > sa_peak_max) {
++			sa_peak_max = pk;
++		}
++		if (pk > SA_LOUD) {
++			sa_last_loud = mach_absolute_time();
++		}
+ 		__asm__ volatile("dmb ish" ::: "memory");
+ 		sa_head = h + frames;
+ 		sweet_audio_frames_in += frames;
+@@ -108,6 +133,24 @@ sa_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 	return 0;
+ }
+ 
++static int
++sa_level_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char line[128];
++	uint64_t now = mach_absolute_time(), ns = 0, ago = ~0ull;
++	if (sa_last_loud != 0) {
++		absolutetime_to_nanoseconds(now - sa_last_loud, &ns);
++		ago = ns / 1000000;
++	}
++	int n = snprintf(line, sizeof(line), "%llu %u %u %lld %u", sweet_audio_frames_in, sa_peak_last, sa_peak_max,
++	    sa_last_loud != 0 ? (long long)ago : -1LL, sa_head - sa_tail);
++	sa_peak_max = 0;
++	return SYSCTL_OUT(req, line, (size_t)n + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_level, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
++    sa_level_sysctl, "A", "iOS sound into /dev/redwood-audio: frames peak_last peak_max loud_ms_ago ring_frames");
++
+ static int
+ sa_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
+ {
