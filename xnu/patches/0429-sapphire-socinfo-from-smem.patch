@@ -1,0 +1,96 @@
+xnu 0429: kern.sweet_socinfo, the SoC's identity from SMEM item 137
+
+The video block's firmware depends on which khaje the ABL booted: msm-id 518 (0x206, khaje) asks for venus.mbn, 586
+(0x24a, khajeiot) for venus_4mb.mbn (dev-notes/investigacion/anexos/31-video/02). The board overlay accepts both, so the
+unit's own SMEM decides, as for Linux and Android: item SMEM_HW_SW_BUILD_ID (137) in the global partition, struct socinfo
+of include/linux/soc/qcom/socinfo.h. Read-only, through the SMEM mapping and partition walk the modem already uses;
+"SMEM not mapped yet" before the modem thread maps it. The serial number that follows foundry_id is not shown.
+---
+diff --git a/bsd/dev/sweet_qmi_dev.c b/bsd/dev/sweet_qmi_dev.c
+index 9b94001..9626229 100644
+--- a/bsd/dev/sweet_qmi_dev.c
++++ b/bsd/dev/sweet_qmi_dev.c
+@@ -313,6 +313,21 @@ sysctl_sweet_modem_stats SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_modem_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_modem_stats, "A", "modem GLINK/QRTR counters");
+ 
++/* 0429: the SoC's identity from SMEM item 137 (TopazModem.cpp topaz_socinfo) */
++extern int topaz_socinfo(char *buf, size_t len);
++static int
++sysctl_sweet_socinfo SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[256];
++	if (topaz_socinfo(buf, sizeof(buf)) < 0) {
++		buf[0] = 0;
++	}
++	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_socinfo, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_socinfo, "A", "SoC id, version and platform from SMEM (socinfo)");
++
+ /*
+  * 0265: FastRPC to the ADSP's sensors PD (TopazModem.cpp): kern.sweet_frpc = 1 attaches and starts the
+  * reverse-call listener (EAGAIN: the GLINK channel is not up yet); reading it gives the state
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 37f80af..cfe960f 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -914,6 +914,57 @@ topaz_modem_stats(char *buf, size_t len)
+ 	return n;
+ }
+ 
++/*
++ * 0429: the SoC's identity from SMEM, as Linux and Android read it (drivers/soc/qcom/socinfo.c: item
++ * SMEM_HW_SW_BUILD_ID = 137 in the global partition; struct socinfo in include/linux/soc/qcom/socinfo.h: fmt, id, ver,
++ * build_id[32], then raw_id/raw_ver from format 0.2, hw_plat 0.3, plat_ver 0.4, hw_plat_subtype 0.6, foundry_id 0.9).
++ * The video firmware is chosen by the id (khaje 518 = 0x206, khajeiot 586 = 0x24a; anexo 31-video/02 §1). The
++ * serial number that follows foundry_id is personal and not shown. kern.sweet_socinfo.
++ */
++struct socinfo_v09 {
++	uint32_t fmt, id, ver;
++	char build_id[32];
++	uint32_t raw_id, raw_ver, hw_plat, plat_ver, accessory_chip, hw_plat_subtype;
++	uint32_t pmic_model, pmic_die_rev, pmic_model_1, pmic_die_rev_1, pmic_model_2, pmic_die_rev_2;
++	uint32_t foundry_id;
++} __attribute__((packed));
++
++extern "C" int
++topaz_socinfo(char *buf, size_t len)
++{
++	struct smem_part_hdr *g;
++	const struct socinfo_v09 *si;
++	uint32_t sz = 0;
++	char build[33];
++
++	if (smem == NULL) {
++		return snprintf(buf, len, "SMEM not mapped yet");
++	}
++	g = smem_partition(SMEM_GLOBAL_HOST, SMEM_GLOBAL_HOST);
++	si = g != NULL ? (const struct socinfo_v09 *)smem_get(g, 137, &sz) : NULL;
++	if (si == NULL || sz < __builtin_offsetof(struct socinfo_v09, build_id) + sizeof(si->build_id)) {
++		return snprintf(buf, len, "no socinfo (item 137) in the global partition%s", g == NULL ? " (no global partition)" : "");
++	}
++	memcpy(build, si->build_id, 32);
++	build[32] = 0;
++	int n = snprintf(buf, len, "format %u.%u id %u (0x%x) version %u.%u build \"%s\"", si->fmt >> 16, si->fmt & 0xffff,
++	    si->id, si->id, si->ver >> 16, si->ver & 0xffff, build);
++	if (si->fmt >= 0x00002 && sz >= __builtin_offsetof(struct socinfo_v09, hw_plat)) {
++		n += snprintf(buf + n, len - n, " raw_id %u raw_ver %u", si->raw_id, si->raw_ver);
++	}
++	if (si->fmt >= 0x00004 && sz >= __builtin_offsetof(struct socinfo_v09, accessory_chip)) {
++		n += snprintf(buf + n, len - n, " hw_platform %u platform_version %u.%u", si->hw_plat, si->plat_ver >> 16, si->plat_ver & 0xffff);
++	}
++	if (si->fmt >= 0x00006 && sz >= __builtin_offsetof(struct socinfo_v09, pmic_model)) {
++		n += snprintf(buf + n, len - n, " platform_subtype %u", si->hw_plat_subtype);
++	}
++	if (si->fmt >= 0x00009 && sz >= sizeof(struct socinfo_v09)) {
++		n += snprintf(buf + n, len - n, " foundry %u", si->foundry_id);
++	}
++	n += snprintf(buf + n, len - n, " (item %u bytes)", sz);
++	return n;
++}
++
+ /* ---------------------------------------------------------------- GLINK RX */
+ 
+ static bool
