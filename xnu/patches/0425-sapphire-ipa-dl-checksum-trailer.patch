@@ -1,0 +1,149 @@
+xnu 0425: modem RX steps over the IPA's downlink checksum trailer (kern.sweet_ipa_dl_trailer), and counts how frames parse
+
+Endpoint 9 (modem -> AP RX) is programmed with CS_OFFLOAD_EN = DL (ipa_ep_program(), ENDP_INIT_CFG bits 2:1 = 2), as
+Linux does for an RX endpoint with .checksum = true (drivers/net/ipa/data/ipa_data-v4.2.c, AP_MODEM_RX;
+ipa_endpoint_init_cfg(): IPA_CS_OFFLOAD_DL below IPA v4.5). With that mode the IPA appends to each QMAP packet a
+struct rmnet_map_dl_csum_trailer (include/linux/if_rmnet.h) that the QMAP pkt_len does not count. rmnet steps over
+it (rmnet_map_deaggregate(), drivers/net/ethernet/qualcomm/rmnet/rmnet_map_data.c: packet_len = pkt_len + header +
+sizeof(trailer) with RMNET_FLAGS_INGRESS_MAP_CKSUMV4), and so does the IPA driver's status path (ipa_endpoint.c,
+"a trailer containing computed checksum information will be appended"). ipa_rx_event() advanced by header +
+pkt_len only: in a frame holding more than one packet it took the first trailer for the next QMAP header and the
+rest of the frame was lost without being counted.
+
+kern.sweet_ipa_dl_trailer (boot-arg sweet_ipa_dl_trailer), 0 by default: parsing exactly as before. With 1 the
+parser steps over sizeof(struct qmap_dl_csum_trailer) (the Linux layout, static_assert 8) after each packet, only
+while endpoint 9's CS_OFFLOAD_EN, read back from the register, is DL. Nothing else changes: no register, buffer,
+period or modem setting.
+
+In both modes kern.sweet_ipa_stats gains a line "modem RX parse": the CS_OFFLOAD_EN the hardware holds, frames
+with more than one packet, frames with bytes left after the last parsed packet (and how many bytes), single-packet
+frames whose leftover is exactly one trailer (the trailer seen from the hardware), and trailers with the valid
+flag (mode 1).
+---
+diff --git a/bsd/dev/sweet_qmi_dev.c b/bsd/dev/sweet_qmi_dev.c
+index abb1841..2f16470 100644
+--- a/bsd/dev/sweet_qmi_dev.c
++++ b/bsd/dev/sweet_qmi_dev.c
+@@ -476,6 +476,11 @@ sysctl_sweet_ipa_stats SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_ipa_stats, "A", "IPA channels and registers");
+ 
++/* 0425: step over the IPA's downlink checksum trailer in modem RX frames (TopazModem.cpp, ipa_rx_event) */
++int sweet_ipa_dl_trailer = 0;
++SYSCTL_INT(_kern, OID_AUTO, sweet_ipa_dl_trailer, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_ipa_dl_trailer, 0,
++    "modem RX: 1 = step over the DL checksum trailer when endpoint 9 has CS_OFFLOAD_EN = DL; 0 = as before 0425");
++
+ /* TopazModem, once the modem's IPCRTR channel is up */
+ void
+ sweet_qmi_dev_init(void)
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 3a9eea4..26b9fb6 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -8393,7 +8393,43 @@ static void ipa_qmap_cmd(const uint8_t *frame, uint16_t len);
+ extern "C" void sweet_pdp_create(void);
+ extern "C" void sweet_pdp_input(const uint8_t *pkt, uint32_t len);
+ 
+-/* QMAP frames from the modem: [flags/pad, mux id, length (big endian)] + packet, back to back */
++/*
++ * sapphire 0425: the downlink checksum trailer of modem RX.
++ *
++ * Endpoint 9 runs with CS_OFFLOAD_EN = DL (ipa_ep_program(), as Linux's ipa_endpoint_init_cfg() for an RX endpoint
++ * with .checksum, ipa_data-v4.2.c). With it the IPA appends to every QMAP packet an 8-byte trailer that the QMAP
++ * length does not count: rmnet steps over it (rmnet_map_deaggregate(), rmnet_map_data.c: packet_len = pkt_len +
++ * header, + sizeof(struct rmnet_map_dl_csum_trailer) with RMNET_FLAGS_INGRESS_MAP_CKSUMV4, data or command alike),
++ * and so does the IPA driver's own status path (ipa_endpoint.c, "a trailer containing computed checksum
++ * information will be appended"). The parser below stepped only over header + length, so in a frame holding more
++ * than one packet it read the first trailer as the next QMAP header and dropped the rest of the frame.
++ *
++ * kern.sweet_ipa_dl_trailer (boot-arg sweet_ipa_dl_trailer), 0 by default: parsing exactly as before. With 1 the
++ * parser steps over the trailer when endpoint 9's CS_OFFLOAD_EN reads DL, the size being the trailer's own layout
++ * (include/linux/if_rmnet.h). The counters in kern.sweet_ipa_stats ("modem RX parse") run in both modes: frames
++ * with more than one packet, frames with bytes left after the last packet, and single-packet frames whose leftover
++ * is exactly one trailer (the trailer seen from the hardware itself).
++ */
++struct qmap_dl_csum_trailer {                   /* Linux include/linux/if_rmnet.h, struct rmnet_map_dl_csum_trailer */
++	uint8_t reserved1;
++	uint8_t flags;                          /* bit 0: checksum and length valid */
++	uint16_t csum_start_offset;             /* big endian */
++	uint16_t csum_length;                   /* big endian */
++	uint16_t csum_value;
++} __attribute__((packed));
++static_assert(sizeof(struct qmap_dl_csum_trailer) == 8, "QMAP DL checksum trailer");
++#define IPA_CS_OFFLOAD_DL       2               /* Linux ipa_reg.h enum ipa_cs_offload_en, IPA < v4.5 */
++extern "C" int sweet_ipa_dl_trailer;            /* bsd/dev/sweet_qmi_dev.c */
++static uint64_t ipa_mrx_multi, ipa_mrx_left, ipa_mrx_left_bytes, ipa_mrx_tail_trailer, ipa_mrx_csum_valid;
++
++/* endpoint 9's CS_OFFLOAD_EN field (ENDP_INIT_CFG bits 2:1, Linux reg/ipa_reg-v4.2.c), as the hardware holds it */
++static unsigned
++ipa_mrx_cs_offload(void)
++{
++	return (ir(IPA_EP(IPA_EP_CFG, 9)) >> 1) & 3;
++}
++
++/* QMAP frames from the modem: [flags/pad, mux id, length (big endian)] + packet (+ DL checksum trailer), back to back */
+ static void
+ ipa_rx_event(struct ipa_chan *c, const uint8_t *e)
+ {
+@@ -8409,13 +8445,21 @@ ipa_rx_event(struct ipa_chan *c, const uint8_t *e)
+ 	c->bytes += len;
+ 	ipa_raw_keep(c == IPA_MRX ? 3 : 2, d, len);
+ 	if (c == IPA_MRX) {
++		bool dl_csum = ipa_mrx_cs_offload() == IPA_CS_OFFLOAD_DL;
++		uint32_t trl = (sweet_ipa_dl_trailer != 0 && dl_csum) ? (uint32_t)sizeof(struct qmap_dl_csum_trailer) : 0;
++		uint32_t end = 0, n_in_frame = 0;
+ 		for (uint32_t off = 0; off + 4 <= len;) {
+ 			uint8_t pad = d[off] & 0x3f, mux = d[off + 1];
+ 			bool cmd = (d[off] & 0x80) != 0;
+ 			uint16_t plen = (uint16_t)((d[off + 2] << 8) | d[off + 3]);
+-			if (plen == 0 || off + 4 + plen > len) {
++			if (plen == 0 || off + 4 + plen + trl > len) {
+ 				break;
+ 			}
++			if (trl != 0 && (d[off + 4 + plen + 1] & 1) != 0) {
++				ipa_mrx_csum_valid++;
++			}
++			n_in_frame++;
++			end = off + 4 + plen + trl;
+ 			c->pkts++;
+ 			ipa_mux_seen[mux & 7]++;
+ 			if (!cmd) {
+@@ -8432,7 +8476,17 @@ ipa_rx_event(struct ipa_chan *c, const uint8_t *e)
+ 				    c->pkts, mux, cmd ? " (QMAP command)" : "", plen, pad, ip[0], ip[1], ip[2], ip[3],
+ 				    plen > 9 ? ip[9] : 0);
+ 			}
+-			off += 4 + plen;
++			off += 4 + plen + trl;
++		}
++		if (n_in_frame > 1) {
++			ipa_mrx_multi++;
++		}
++		if (len > end) {
++			ipa_mrx_left++;
++			ipa_mrx_left_bytes += len - end;
++			if (n_in_frame == 1 && trl == 0 && len - end == sizeof(struct qmap_dl_csum_trailer)) {
++				ipa_mrx_tail_trailer++;
++			}
+ 		}
+ 	} else if (c->frames <= 8) {
+ 		LOG("ipa: %s frame %llu: %u bytes, status opcode %02x endpoint %u", c->name, c->frames, len, d[0],
+@@ -9160,6 +9214,11 @@ topaz_ipa_stats(char *buf, size_t len)
+ 		n += snprintf(buf + n, len - n, "tx queue: head %u tail %u, posted %llu sent %llu, full %llu\n", ipa_txq_head,
+ 		    ipa_txq_tail, ipa_tx_posted, ipa_tx_sent, ipa_tx_full);
+ 	}
++	if (n > 0 && (size_t)n < len && ipa_r != NULL) {     /* 0425 */
++		n += snprintf(buf + n, len - n, "modem RX parse: CS_OFFLOAD_EN %u, trailer %s; multi-packet frames %llu, frames with bytes left %llu (%llu bytes), single packet + trailer-sized leftover %llu, trailers valid %llu\n",
++		    ipa_mrx_cs_offload(), sweet_ipa_dl_trailer != 0 ? "stepped over" : "not stepped over (as before 0425)", ipa_mrx_multi,
++		    ipa_mrx_left, ipa_mrx_left_bytes, ipa_mrx_tail_trailer, ipa_mrx_csum_valid);
++	}
+ 	return n;
+ }
+ 
+@@ -15229,6 +15288,7 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ 		wifi_on = 0;
+ 	}
+ 	(void)PE_parse_boot_argn("ipa", &ipa_on, sizeof(ipa_on));
++	(void)PE_parse_boot_argn("sweet_ipa_dl_trailer", &sweet_ipa_dl_trailer, sizeof(sweet_ipa_dl_trailer));   /* 0425 */
+ 	if (ipa_on && !ipa_hw_init()) {
+ 		LOG("ipa: not up (step: %s): the modem is told \"AP IPA power off\"", ipa_step);
+ 	}

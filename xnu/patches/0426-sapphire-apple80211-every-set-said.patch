@@ -1,0 +1,28 @@
+xnu 0426: every Apple80211 SET is said in the log
+
+The request log stops after 800 lines, and wifid's reads (SCAN_RESULT, CURRENT_NETWORK: hundreds a minute with
+Settings open) used them up before a join was tried from Settings. On 2026-11-20 a join from Settings failed at once
+with -3903 (kCWNotSupportedErr, the driver's EOPNOTSUPP), while wifijoin's lone ASSOCIATE joins the same network: the
+SET that wifid makes and the driver does not answer went unlogged. Reads keep the 800-line limit; every SET is logged.
+---
+diff --git a/bsd/dev/sapphire_apple80211.c b/bsd/dev/sapphire_apple80211.c
+index d660bb6..10eb8c7 100644
+--- a/bsd/dev/sapphire_apple80211.c
++++ b/bsd/dev/sapphire_apple80211.c
+@@ -856,9 +856,13 @@ sapphire_apple80211_ioctl(u_long command, void *data)
+ 	proc_selfname(who, sizeof(who));
+ 	error = is_set ? set(request, what, sizeof(what)) : get(request, what, sizeof(what));
+ 	note(request, is_set, error);
+-	/* (a request that is repeated for ever is said a few hundred times) */
+-	if (said < 800 || request->req_type == 51) {        /* (0424: the country, always) */
+-		said++;
++	/*
++	 * (a request that is repeated for ever is said a few hundred times). 0426: every SET is said: wifid's reads of the
++	 * scan results and the current network (hundreds a minute) used the 800 lines up before a join from Settings, and
++	 * which request wifid made of a join, and what it was told, went unsaid.
++	 */
++	if (said < 800 || is_set || request->req_type == 51) {        /* (0424: the country, always) */
++		said += is_set ? 0 : 1;
+ 		printf("apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
+ 		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==
+ 		    EOPNOTSUPP ? "REFUSED\n" : "");
