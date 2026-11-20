@@ -42,7 +42,7 @@ cluster down by 15-21 %, commit -> done latency the same or lower. Protocol: dev
 16-despertares/02-parches.md.
 ---
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
-index 068c6f6..86b7bfb 100644
+index 068c6f6..7433deb 100644
 --- a/iokit/Kernel/arm/SapphireGpu.cpp
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
 @@ -47,6 +47,7 @@
@@ -53,7 +53,7 @@ index 068c6f6..86b7bfb 100644
  #include <kern/clock.h>
  #include <pexpert/pexpert.h>
  #include <libkern/crc.h>
-@@ -2513,6 +2514,14 @@ reg1(uint32_t reg, uint32_t v)
+@@ -2513,6 +2514,17 @@ reg1(uint32_t reg, uint32_t v)
  
  static uint32_t fence_seq;                      /* the last timestamp handed to the GPU */
  static uint32_t msm_seq;                        /* 0153: the last msm submission's (OFF_MSM_FENCE) */
@@ -65,10 +65,13 @@ index 068c6f6..86b7bfb 100644
 +#define CP_EVENT_IRQ            (1u << 31)
 +#define RBBM_INT_CACHE_FLUSH_TS (1u << 20)
 +static volatile uint32_t girq_armed;
++static int gpu_wait_mode;                       /* kern.sweet_gpu_wait */
++static uint64_t gpu_irq_mpidr;                  /* kern.sweet_gpu_irq_mpidr: where the distributor sends it */
++static bool girq_arm(void);
  
  static void
  event(uint32_t ev, bool ts)
-@@ -2530,7 +2539,7 @@ event(uint32_t ev, bool ts)
+@@ -2530,7 +2542,7 @@ event(uint32_t ev, bool ts)
  	 * turnip asks for in its trace timestamps -- and every fence of 0145-0153 was that counter:
  	 * "done" while it was under 2^31 (the first ~112 s of a boot at 19.2 MHz), never after.
  	 */
@@ -77,7 +80,7 @@ index 068c6f6..86b7bfb 100644
  	emit((uint32_t)(POOL_PA + OFF_FENCE));
  	emit((uint32_t)((POOL_PA + OFF_FENCE) >> 32));
  	emit(++fence_seq);
-@@ -3777,6 +3786,8 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -3777,6 +3789,8 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
  	(void)PE_parse_boot_argn("gpu_copy_async", &copy_async, sizeof(copy_async));
  	(void)PE_parse_boot_argn("gpu_smmu_early", &smmu_early, sizeof(smmu_early));
  	(void)PE_parse_boot_argn("gpu_irq", &gpu_irq, sizeof(gpu_irq));
@@ -86,7 +89,7 @@ index 068c6f6..86b7bfb 100644
  	(void)PE_parse_boot_argn("gpu_stop", &stop_at, sizeof(stop_at));
  	(void)PE_parse_boot_argn("gpu_keep", &keep_running, sizeof(keep_running));
  	(void)PE_parse_boot_argn("gpu_draw", &draw_first, sizeof(draw_first));
-@@ -3935,6 +3946,13 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -3935,6 +3949,13 @@ gpu_thread(void *arg __unused, wait_result_t wr __unused)
  	}
  	if (service && mmu && service_lock != NULL && service_ok) {
  		service_ready = true;
@@ -100,7 +103,7 @@ index 068c6f6..86b7bfb 100644
  		LOG("*** gpu_service: the GPU stays up and takes copies (%u page tables in use) ***", pt_used);
  		msm_publish();
  		gov_boot_khz = opp_khz;                 /* 0346 */
-@@ -5759,6 +5777,173 @@ gpool_alloc(uint64_t n)
+@@ -5759,6 +5780,171 @@ gpool_alloc(uint64_t n)
  	return 0;
  }
  
@@ -132,10 +135,8 @@ index 068c6f6..86b7bfb 100644
 +#define GICD_IPRIORITYR     0x0400u
 +#define GICD_ICFGR          0x0C00u
 +#define GICD_IROUTER        0x6000u
-+static int gpu_wait_mode;                       /* kern.sweet_gpu_wait */
 +static int gpu_wait_max_us = 500;               /* kern.sweet_gpu_wait_max_us: the back-off's longest sleep */
 +static int gpu_wait_irq_us = 2000;              /* kern.sweet_gpu_wait_irq_us: the longest sleep waiting for the interrupt */
-+static uint64_t gpu_irq_mpidr;                  /* kern.sweet_gpu_irq_mpidr: where the distributor sends it */
 +static int girq_fence_event;                    /* what the waiters sleep on */
 +static event_t volatile girq_listener;          /* one more event woken by every fence interrupt (0420: the frame queue) */
 +static struct {
@@ -274,7 +275,7 @@ index 068c6f6..86b7bfb 100644
  /* Wait for fence f, without the service lock, up to ms; false if it never came. */
  static bool
  msm_wait(uint32_t f, uint64_t ms)
-@@ -5774,6 +5959,7 @@ msm_wait(uint32_t f, uint64_t ms)
+@@ -5774,6 +5960,7 @@ msm_wait(uint32_t f, uint64_t ms)
  		return false;
  	}
  	uint64_t diag_t0 = mach_absolute_time();
@@ -282,7 +283,7 @@ index 068c6f6..86b7bfb 100644
  	clock_interval_to_deadline((uint32_t)ms, kMillisecondScale, &deadline);
  	while (!msm_fence_done(f)) {
  		now = mach_absolute_time();
-@@ -5790,12 +5976,83 @@ msm_wait(uint32_t f, uint64_t ms)
+@@ -5790,12 +5977,83 @@ msm_wait(uint32_t f, uint64_t ms)
  			return false;
  		}
  		OSAddAtomic64(1, (volatile SInt64 *)&gdiag.wait_loops);
@@ -367,7 +368,7 @@ index 068c6f6..86b7bfb 100644
  /* How long from now a time of msm's is (CLOCK_MONOTONIC = mach_continuous_time here), in ms; at most 2 s. */
  static uint64_t
  msm_ms_until(const struct msm_timespec *when)
-@@ -5869,6 +6126,11 @@ gpu_recover(void)
+@@ -5869,6 +6127,11 @@ gpu_recover(void)
  	*(volatile uint32_t *)(pool + OFF_MSM_FENCE) = msm_seq;
  	*(volatile uint32_t *)(pool + OFF_FENCE) = fence_seq;
  	gmb();
@@ -379,7 +380,7 @@ index 068c6f6..86b7bfb 100644
  	smmu_fault("msm: recover");
  	return true;
  }
-@@ -7338,7 +7600,7 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+@@ -7338,7 +7601,7 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
  			gdiag_mark(POOL_PA + OFF_DIAG + mark * 16u + 8);        /* all of it drawn */
  		}
  		emit(pkt7(CP_EVENT_WRITE, 4));          /* CACHE_FLUSH_TS into the msm slot (event() writes the shared one) */
