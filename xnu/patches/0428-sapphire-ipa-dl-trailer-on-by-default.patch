@@ -1,0 +1,36 @@
+xnu 0428: the IPA's downlink checksum trailer is stepped over by default
+
+Measured on 2026-11-20 (0425 switched on at run time, kern.sweet_ipa_stats "modem RX parse", LTE RSRP -105 dBm):
+before, 13095 frames carried 13095 packets and all 13095 had bytes left (7.8 MB thrown away, 8871 of them exactly one
+packet and one 8-byte trailer); after, 10948 frames carried 47623 packets (4.3 a frame), 47623 valid trailers stepped
+over, no frame with bytes left, and the user's downloads went from tens of kbit/s to fast. The trailer is stepped
+over only while endpoint 9's CS_OFFLOAD_EN reads DL (0425); boot-arg sweet_ipa_dl_trailer=0 parses as before.
+---
+diff --git a/bsd/dev/sweet_qmi_dev.c b/bsd/dev/sweet_qmi_dev.c
+index 2f16470..9b94001 100644
+--- a/bsd/dev/sweet_qmi_dev.c
++++ b/bsd/dev/sweet_qmi_dev.c
+@@ -477,7 +477,7 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLF
+     0, 0, sysctl_sweet_ipa_stats, "A", "IPA channels and registers");
+ 
+ /* 0425: step over the IPA's downlink checksum trailer in modem RX frames (TopazModem.cpp, ipa_rx_event) */
+-int sweet_ipa_dl_trailer = 0;
++int sweet_ipa_dl_trailer = 1;   /* 0428: on by default (measured 2026-11-20); 0 parses as before 0425 */
+ SYSCTL_INT(_kern, OID_AUTO, sweet_ipa_dl_trailer, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_ipa_dl_trailer, 0,
+     "modem RX: 1 = step over the DL checksum trailer when endpoint 9 has CS_OFFLOAD_EN = DL; 0 = as before 0425");
+ 
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index b3ff422..37f80af 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -8949,8 +8949,8 @@ extern "C" void sweet_pdp_input(const uint8_t *pkt, uint32_t len);
+  * information will be appended"). The parser below stepped only over header + length, so in a frame holding more
+  * than one packet it read the first trailer as the next QMAP header and dropped the rest of the frame.
+  *
+- * kern.sweet_ipa_dl_trailer (boot-arg sweet_ipa_dl_trailer), 0 by default: parsing exactly as before. With 1 the
+- * parser steps over the trailer when endpoint 9's CS_OFFLOAD_EN reads DL, the size being the trailer's own layout
++ * kern.sweet_ipa_dl_trailer (boot-arg sweet_ipa_dl_trailer), 1 by default since 0428 (0: parsing as before 0425). With
++ * 1 the parser steps over the trailer when endpoint 9's CS_OFFLOAD_EN reads DL, the size being the trailer's own layout
+  * (include/linux/if_rmnet.h). The counters in kern.sweet_ipa_stats ("modem RX parse") run in both modes: frames
+  * with more than one packet, frames with bytes left after the last packet, and single-packet frames whose leftover
+  * is exactly one trailer (the trailer seen from the hardware itself).
