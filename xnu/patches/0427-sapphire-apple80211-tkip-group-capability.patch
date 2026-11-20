@@ -1,0 +1,32 @@
+xnu 0427: CARD_CAPABILITIES says TKIP and TKIPMIC, which the station does for a TKIP group key
+
+A join from Settings to a WPA/WPA2 network with a CCMP pairwise and a TKIP group cipher failed at once in wifid with
+-3903 (kCWNotSupportedErr) and no ASSOCIATE reached the driver (0426's log: DISASSOCIATE, 6G_MODE, nothing more); the
+same network joined through a bare ASSOCIATE (wifijoin). The capabilities answered to wifid (APPLE80211_IOC 12) had
+AES, AES_CCM and WPA2 but not TKIP (1) nor TKIPMIC (12) (apple80211_var.h, enum apple80211_card_capability), while
+the station installs a TKIP group key with its MIC keys (0129). The bits are now named and each stands for what the
+station does; pairwise TKIP and WPA1 are not done and stay unsaid.
+---
+diff --git a/bsd/dev/sapphire_apple80211.c b/bsd/dev/sapphire_apple80211.c
+index 10eb8c7..32e7ed0 100644
+--- a/bsd/dev/sapphire_apple80211.c
++++ b/bsd/dev/sapphire_apple80211.c
+@@ -370,7 +370,17 @@ get(struct apple80211req *request, char *said, size_t said_size)
+ 		 * for a WPA2 network ("Unable to join").
+ 		 */
+ 		uint8_t bits[13] = { 0 };
+-		static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };
++		/*
++		 * 0427: each bit for what the station does (apple80211_var.h, enum apple80211_card_capability): TKIP (1) and
++		 * TKIPMIC (12) too, since the station installs a TKIP group key with its MIC keys (0129, w_install_key: a
++		 * WPA/WPA2 network with a CCMP pairwise and a TKIP group cipher). Without them wifid would not ask a join of
++		 * such a network: on 2026-11-20 it failed it at once with -3903 (kCWNotSupportedErr), no ASSOCIATE sent, while
++		 * a CCMP-only network joined. Pairwise TKIP and WPA1 are not done and stay unsaid.
++		 */
++		enum { CAP_TKIP = 1, CAP_AES = 2, CAP_AES_CCM = 3, CAP_PMGT = 6, CAP_SHSLOT = 9, CAP_SHPREAMBLE = 10,
++		       CAP_TKIPMIC = 12, CAP_WPA2 = 14, CAP_WME = 17, CAP_SHORT_GI_20MHZ = 19 };
++		static const uint8_t has[] = { CAP_TKIP, CAP_AES, CAP_AES_CCM, CAP_PMGT, CAP_SHSLOT, CAP_SHPREAMBLE, CAP_TKIPMIC,
++		    CAP_WPA2, CAP_WME, CAP_SHORT_GI_20MHZ };
+ 
+ 		for (unsigned i = 0; i < sizeof(has); i++) {
+ 			bits[has[i] / 8] |= (uint8_t)(1u << (has[i] % 8));
