@@ -1,0 +1,618 @@
+xnu 0417: what is held of a scanout pool surface no program has goes without waiting for the next frame
+
+0416 took away the largest holder of dead framebuffers (the released IOSurface views). Three more held a surface of the
+framebuffer's scanout pool, and its 5 MiB slot, after every program had let it go (dev-notes/investigacion/anexos/
+18-presentacion-y-dpu/01-retencion-de-frames.md, R2, R4, R5):
+
+- A GPU buffer closed while the GPU still had work on it waits in its client's fLeft until reap(), and reap() ran only at
+  that client's next GEM_SUBMIT. With the display off the window server submits nothing: the buffer, and the surface
+  under it, stayed until "on", when CoreAnimation makes its new framebuffers before its first submission.
+- The frame on the panel (fScanShow) of a backboardd that exited stayed until the new one presented and the MDP took
+  that flip (removeClient() only took the client off the list); a swap recorded while the display was off (fPendHold)
+  held its surface until "on", also when its window server had gone.
+- directPresent()'s fLastSurf (3x only) was never let go when present() went the copy's way.
+
+Now:
+- SapphireGpu.cpp: the open clients are listed (msm_clients[], service_lock). GEM_NEW, GEM_CLOSE and the surface request
+  reap first; a buffer of a surface left arms a 50 ms thread call that reaps every client until none is left; and
+  sapphire_gpu_reap_all() reaps every client for the pool before it refuses a surface and for the census. clientClose()
+  already freed everything after waiting for the GPU; a client also leaves the list in free(). What is freed is what
+  the GPU is done with (its fence), as before.
+- SweetSurface.cpp: a full pool reaps and looks once more before it gives the surface ordinary memory; the last user of
+  a pool surface going (sweet_surface_put()) has the framebuffer look, from a thread call, for what it holds of it.
+- SweetFramebuffer.cpp (surfacesGone()): a swap kept while off whose surface left the table is let go and its layer
+  taken out of the pending record (nothing of it is shown at "on"); the frame on the panel of such a surface, with the
+  display on and the queue empty, is shown again by the copy into a flip buffer, as scanoutStop() does: the picture
+  stays and the surface goes when the MDP takes that flip (scanoutRetire()). The frames the MDP may still read
+  (fScanLeave, the queue) keep their rules. present() lets go of fLastSurf with fLastVA when there are flip buffers
+  (then directPresent() copied it, it was not scanned).
+
+kern.sweet_fb_scanout_diag reaps and looks before it describes the pool, and says what each of these freed:
+"0417: GPU buffers of surfaces freed at their fence …; pool full: a slot after reaping …; framebuffer: …".
+
+Not measured on the phone yet: the protocol is in 18-presentacion-y-dpu/04-parches-0417-0418.md.
+---
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index f136ee7..068c6f6 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -46,6 +46,7 @@
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOPlatformExpert.h>               /* IOService::getPlatform() (the msm service) */
+ #include <kern/thread.h>
++#include <kern/thread_call.h>                     /* 0417: the reaper of buffers left (msm_reap_call) */
+ #include <kern/clock.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/crc.h>
+@@ -6322,6 +6323,7 @@ public:
+ 
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+ 	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;    /* 0417: out of msm_clients[] if clientClose() never came */
+ 	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
+ 	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
+ 	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
+@@ -6331,7 +6333,7 @@ public:
+ 	bool place(struct msm_bo *b);
+ 	void drop(struct msm_bo *b);
+ 	void freeBo(struct msm_bo *b);
+-	void reap(void);
++	uint32_t reap(void);                    /* 0417: the buffers of surfaces still left after it */
+ 	IOReturn gemNew(struct msm_gem_new *r);
+ 	IOReturn gemInfo(struct msm_gem_info *r);
+ 	IOReturn surface(struct msm_surface *r);
+@@ -6342,6 +6344,126 @@ public:
+ 
+ OSDefineMetaClassAndStructors(SapphireGPUClient, IOUserClient);
+ 
++/*
++ * sapphire 0417: buffers left (fLeft: closed while the GPU still had them) are freed by reap(), and before this only a
++ * GEM_SUBMIT of the same client reaped. A buffer over a surface of the framebuffer's scanout pool kept the surface, and
++ * its slot, until that client submitted again: all the time the display was off, for the window server, and at "on"
++ * CoreAnimation makes its new framebuffers before its first submission. Now the open clients are known here
++ * (msm_clients[], service_lock), each request that takes service_lock to make, find or close a buffer reaps first, a
++ * buffer of a surface left arms a timer that reaps every client until none is left, and the pool reaps every client
++ * before it refuses a surface (sapphire_gpu_reap_all()). What is freed is what the GPU is done with (its fence), as
++ * before: nothing the GPU or the panel still reads.
++ */
++#define MSM_CLIENTS         64u
++#define MSM_REAP_MS         50u                 /* the timer's period while buffers of surfaces wait for their fence */
++static SapphireGPUClient *msm_clients[MSM_CLIENTS];
++static thread_call_t msm_reap_call;
++static bool msm_reap_armed;                     /* (service_lock) */
++static struct {
++	uint64_t reaped;                        /* buffers of surfaces freed after their fence, by any reap() */
++	uint64_t by_timer, by_pool, by_query;   /* ... of them by msm_reap_tick(), and by sapphire_gpu_reap_all() */
++	uint64_t ticks;                         /* times the timer ran */
++	uint32_t waiting;                       /* buffers of surfaces left, at the last reaping of every client */
++} gleft;
++
++/* service_lock held */
++static void
++msm_reap_arm(void)
++{
++	uint64_t deadline;
++
++	if (msm_reap_call == NULL || msm_reap_armed) {
++		return;
++	}
++	clock_interval_to_deadline(MSM_REAP_MS, kMillisecondScale, &deadline);
++	msm_reap_armed = true;
++	(void)thread_call_enter_delayed(msm_reap_call, deadline);
++}
++
++/* every client's buffers left whose fence is done are freed; how many of surfaces were, in *freed. service_lock held. */
++static uint32_t
++msm_reap_all_locked(uint64_t *freed)
++{
++	uint64_t before = gleft.reaped;
++	uint32_t waiting = 0;
++
++	for (uint32_t i = 0; i < MSM_CLIENTS; i++) {
++		if (msm_clients[i] != NULL) {
++			waiting += msm_clients[i]->reap();
++		}
++	}
++	gleft.waiting = waiting;
++	if (freed != NULL) {
++		*freed += gleft.reaped - before;
++	}
++	return waiting;
++}
++
++static void
++msm_reap_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	if (service_lock == NULL) {
++		return;
++	}
++	IOLockLock(service_lock);
++	msm_reap_armed = false;
++	gleft.ticks++;
++	if (msm_reap_all_locked(&gleft.by_timer) != 0) {
++		msm_reap_arm();                 /* (a GPU that hangs is reset after 2 s, and its fences jump: 0317) */
++	}
++	IOLockUnlock(service_lock);
++}
++
++/* service_lock held */
++static void
++msm_client_forget_locked(SapphireGPUClient *c)
++{
++	for (uint32_t i = 0; i < MSM_CLIENTS; i++) {
++		if (msm_clients[i] == c) {
++			msm_clients[i] = NULL;
++		}
++	}
++}
++
++/*
++ * 0417: every client reaped now (why: 0 the scanout pool is full, 1 its census is read); the buffers of surfaces freed.
++ * Takes service_lock: the caller holds neither it nor the surface table's lock (a surface freed here takes that one).
++ */
++extern "C" uint32_t sapphire_gpu_reap_all(int why);
++
++extern "C" uint32_t
++sapphire_gpu_reap_all(int why)
++{
++	uint64_t freed = 0;
++
++	if (service_lock == NULL) {
++		return 0;
++	}
++	IOLockLock(service_lock);
++	(void)msm_reap_all_locked(&freed);
++	if (why == 0) {
++		gleft.by_pool += freed;
++	} else {
++		gleft.by_query += freed;
++	}
++	IOLockUnlock(service_lock);
++	return (uint32_t)freed;
++}
++
++/* 0417: for kern.sweet_fb_scanout_diag (SweetFramebuffer.cpp) */
++extern "C" void sapphire_gpu_left_census(uint64_t v[6]);
++
++extern "C" void
++sapphire_gpu_left_census(uint64_t v[6])
++{
++	v[0] = gleft.reaped;
++	v[1] = gleft.by_timer;
++	v[2] = gleft.by_pool;
++	v[3] = gleft.by_query;
++	v[4] = gleft.ticks;
++	v[5] = gleft.waiting;
++}
++
+ bool
+ SapphireGPUClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
+@@ -6387,10 +6509,39 @@ SapphireGPUClient::initWithTask(task_t owningTask, void *securityID, UInt32 type
+ 		(void)PE_parse_boot_argn("gpu_usermem", &gpu_usermem, sizeof(gpu_usermem));
+ 		(void)PE_parse_boot_argn("gpu_usermem_track", &gpu_usermem_track, sizeof(gpu_usermem_track));
+ 	}
++	if (service_lock != NULL) {
++		/* 0417: known to sapphire_gpu_reap_all(), and the reaper's timer made once */
++		if (msm_reap_call == NULL) {
++			thread_call_t call = thread_call_allocate(msm_reap_tick, NULL);
++			if (call != NULL && !OSCompareAndSwapPtr(NULL, (void *)call, (void * volatile *)&msm_reap_call)) {
++				(void)thread_call_free(call);
++			}
++		}
++		IOLockLock(service_lock);
++		for (uint32_t i = 0; i < MSM_CLIENTS; i++) {
++			if (msm_clients[i] == NULL) {
++				msm_clients[i] = this;
++				break;
++			}
++		}
++		IOLockUnlock(service_lock);
++	}
+ 	LOG("msm: %s opened the GPU", fName);
+ 	return true;
+ }
+ 
++/* 0417 */
++void
++SapphireGPUClient::free(void)
++{
++	if (service_lock != NULL) {
++		IOLockLock(service_lock);
++		msm_client_forget_locked(this);
++		IOLockUnlock(service_lock);
++	}
++	IOUserClient::free();
++}
++
+ /* service_lock held */
+ struct msm_bo *
+ SapphireGPUClient::bo(uint32_t handle)
+@@ -6551,10 +6702,15 @@ SapphireGPUClient::dropKept(uint64_t before)
+ 	return n;
+ }
+ 
+-/* Buffers given back earlier whose submissions are done now: freed. service_lock held. */
+-void
++/*
++ * Buffers given back earlier whose submissions are done now: freed. service_lock held. 0417: returns how many buffers
++ * of surfaces are still left (their fence not done).
++ */
++uint32_t
+ SapphireGPUClient::reap(void)
+ {
++	uint32_t waiting = 0;
++
+ 	for (uint32_t i = 0; fLeft != NULL && i < MSM_LEFT; i++) {
+ 		if (fLeft[i].md != NULL && msm_fence_done(fLeft[i].fence)) {
+ 			fCount++;                       /* (counted out when it was left: release counts it again) */
+@@ -6562,7 +6718,12 @@ SapphireGPUClient::reap(void)
+ 			if (keepBo(&fLeft[i])) {
+ 				continue;               /* 0342 */
+ 			}
++			if (fLeft[i].surf != NULL) {
++				gleft.reaped++;         /* 0417 */
++			}
+ 			freeBo(&fLeft[i]);
++		} else if (fLeft[i].md != NULL && fLeft[i].surf != NULL) {
++			waiting++;
+ 		}
+ 	}
+ 	if (fKeepBytes != 0) {
+@@ -6573,6 +6734,7 @@ SapphireGPUClient::reap(void)
+ 			gkeep.aged += dropKept(now - age);
+ 		}
+ 	}
++	return waiting;
+ }
+ 
+ /*
+@@ -6596,6 +6758,9 @@ SapphireGPUClient::drop(struct msm_bo *b)
+ 			fLeft[i] = *b;
+ 			fCount--;
+ 			fBytes -= b->size;
++			if (b->surf != NULL) {
++				msm_reap_arm();         /* 0417: a surface's buffer is freed at its fence, not at this client's next submission */
++			}
+ 			bzero(b, sizeof(*b));
+ 			return;
+ 		}
+@@ -6615,6 +6780,7 @@ SapphireGPUClient::clientClose(void)
+ 		msm_hung(fName, msm_seq, false);
+ 	}
+ 	IOLockLock(service_lock);
++	msm_client_forget_locked(this);                 /* 0417: (before its arrays go) */
+ 	(void)dropKept(~0ull);                          /* 0342 */
+ 	if (fKeep != NULL) {
+ 		IODelete(fKeep, struct msm_bo, MSM_KEEP);
+@@ -6703,6 +6869,7 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ 		bool reuse = false;
+ 		bzero(&kept, sizeof(kept));
+ 		IOLockLock(service_lock);
++		(void)reap();                   /* 0417: (a buffer left and done may be the one kept for this size) */
+ 		for (uint32_t i = 0; gpu_bocache != 0 && fKeep != NULL && fKeepWhen != NULL && fKeepBytes != 0 && !reuse && i < MSM_KEEP; i++) {
+ 			if (fKeep[i].md != NULL && fKeep[i].size == size) {
+ 				kept = fKeep[i];
+@@ -6905,6 +7072,7 @@ SapphireGPUClient::surface(struct msm_surface *r)
+ 		return kIOReturnSuccess;
+ 	}
+ 	IOLockLock(service_lock);
++	(void)reap();                           /* 0417 */
+ 	for (uint32_t i = 0; i < MSM_BUFFERS; i++) {
+ 		if (fBo[i].md != NULL && fBo[i].surf == s) {
+ 			r->handle = i + 1;              /* the same surface is the same buffer, as Linux's handles */
+@@ -7371,6 +7539,7 @@ SapphireGPUClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
+ 		} else {
+ 			drop(b);
+ 		}
++		(void)reap();                           /* 0417 */
+ 		IOLockUnlock(service_lock);
+ 		break;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 23b1b5e..2e54c40 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -48,6 +48,8 @@ extern "C" void sapphire_gpu_init(void);            /* iokit/Kernel/arm/Sapphire
+ extern "C" void sweet_busy_init(void);              /* iokit/Kernel/arm/SweetBusy.cpp (boot-arg sweetbusy=N) */             /* iokit/Kernel/arm/TopazModem.cpp (boot-arg modem=1) */
+ extern "C" int sweet_console_copy_dirty(void *dst);
+ extern bool sapphire_gpu_copy_pending(void);         /* SapphireGpu.cpp (0212): the last copy is still queued */
++extern "C" uint32_t sapphire_gpu_reap_all(int why);  /* SapphireGpu.cpp (0417) */
++extern "C" void sapphire_gpu_left_census(uint64_t v[6]);
+ 
+ /*
+  * topaz: a surface the MDP may still be fetching counts as in use, so
+@@ -802,6 +804,11 @@ public:
+ 	uint32_t      fBlSent;        /* last level sent to the panel */
+ 	thread_call_t fBlCall;        /* sends the latest level off backboardd's thread */
+ 	static void   blWork(thread_call_param_t p0, thread_call_param_t p1);
++	/* 0417: what the framebuffer holds of pool surfaces no program has (sweet_fb_surface_gone()) */
++	thread_call_t fGoneCall;
++	SweetSurface *fGoneShow;      /* the frame on the panel being shown again by the copy (fPresentLock), or NULL */
++	static void   goneWork(thread_call_param_t p0, thread_call_param_t p1);
++	void          surfacesGone(void);
+ 	bool          dsiDcsLong(const uint8_t *payload, uint32_t len);
+ 	bool          dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len);
+ 	void          setPanelOn(bool on);
+@@ -1092,6 +1099,8 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fLock = IOLockAlloc();
+ 	fPresentLock = IOLockAlloc();
++	fGoneShow = NULL;
++	fGoneCall = thread_call_allocate(&AppleCLCD::goneWork, this);  /* 0417 */
+ 	{
+ 		uint32_t now = 1;
+ 		PE_parse_boot_argn("sweetfb_now", &now, sizeof(now));
+@@ -1673,7 +1682,11 @@ AppleCLCD::removeClient(IOMobileFramebufferUserClient *client)
+ 	if (i != (unsigned int)-1) {
+ 		fClients->removeObject(i);
+ 	}
++	bool last = fClients->getCount() == 0;
+ 	IOLockUnlock(fLock);
++	if (last && fGoneCall != NULL) {
++		thread_call_enter(fGoneCall);   /* 0417: (the window server is gone: what is held of its surfaces, once they go) */
++	}
+ }
+ 
+ static uint32_t
+@@ -1684,6 +1697,106 @@ get32(const uint8_t *p, uint32_t off)
+ 	return v;
+ }
+ 
++/*
++ * sapphire 0417: a surface of the scanout pool has left the table (no program has it: SweetSurface.cpp,
++ * sweet_surface_put()), or the pool is full. From a thread call, the framebuffer lets go of what it holds of such
++ * surfaces and does not need:
++ *  - a swap recorded while the display is off (fPendHold): let go, and its layers out of the pending record, so that
++ *    "on" does not show a frame of a window server that has gone (it held a slot all the time the display was off);
++ *  - the frame on the panel (fScanShow), with the display on and nothing waiting in the queue: shown again by the copy
++ *    into a flip buffer, as scanoutStop() does. The panel keeps its picture, and the surface goes when the MDP has taken
++ *    that flip (scanoutRetire()), as every frame of a surface it leaves. Until then it is the one that kept a slot when
++ *    backboardd was restarted (removeClient() did nothing), up to the new one's first frame.
++ * Nothing the MDP may still read is let go: the frames left (fScanLeave) and those in the queue keep their rules.
++ */
++static struct {
++	uint64_t looks, pend, shown;
++} sweet_fbg;
++
++void
++AppleCLCD::goneWork(thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	((AppleCLCD *)p0)->surfacesGone();
++}
++
++void
++AppleCLCD::surfacesGone(void)
++{
++	SweetSurface *drop[4] = {};
++	bool any = false;
++
++	sweet_fbg.looks++;
++	IOLockLock(fLock);
++	uint32_t mask = get32(fPending, 0x104);
++	for (uint32_t k = 0; k < 4 && k < SWEET_FB_LAYERS; k++) {
++		SweetSurface *s = fPendHold[k];
++		if (s == NULL || sweet_surface_alive(s->id, s)) {
++			continue;
++		}
++		drop[k] = s;
++		fPendHold[k] = NULL;
++		if (get32(fPending, 0x54 + 4 * k) == s->id) {
++			mask &= ~(1u << k);
++		}
++		any = true;
++		sweet_fbg.pend++;
++	}
++	if (any) {
++		bool left = false;
++		memcpy(fPending + 0x104, &mask, sizeof(mask));
++		for (uint32_t k = 0; k < SWEET_FB_LAYERS; k++) {
++			left |= (mask & (1u << k)) != 0 && get32(fPending, 0x54 + 4 * k) != 0;
++		}
++		if (!left) {
++			fDirty = false;         /* (nothing of it to show at "on": the new window server's first frame is) */
++		}
++	}
++	bool off = fPowerOff;
++	IOLockUnlock(fLock);
++	sweet_hold_set(drop, false);
++
++	if (off || fPresentLock == NULL || !fScale2) {
++		return;
++	}
++	uint8_t *rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++	if (rec == NULL) {
++		return;
++	}
++	bzero(rec, SWEET_FB_SWAP_REC_SIZE);
++	IOLockLock(fPresentLock);
++	SweetSurface *gone = NULL;
++	for (uint32_t k = 0; k < 4 && gone == NULL; k++) {
++		if (fScanShow[k] != NULL && !sweet_surface_alive(fScanShow[k]->id, fScanShow[k])) {
++			gone = fScanShow[k];
++		}
++	}
++	if (gone != NULL && fQCount == 0 && queueOn() && !fPowerOff) {
++		/* one layer, the surface on the panel, no swap of its own (0353: swap 0); fScanShow keeps it until retired */
++		uint32_t one = 1, id = gone->id;
++		memcpy(rec + 0x104, &one, sizeof(one));
++		memcpy(rec + 0x54, &id, sizeof(id));
++		SweetSurface *none[4] = {};
++		bool queued = false;
++		fGoneShow = gone;
++		(void)presentQueued(rec, none, &queued);
++		fGoneShow = NULL;
++		sweet_fbg.shown++;
++	}
++	IOLockUnlock(fPresentLock);
++	IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++}
++
++extern "C" void sweet_fb_surface_gone(void);
++
++extern "C" void
++sweet_fb_surface_gone(void)
++{
++	AppleCLCD *fb = sweet_frame_fb;
++	if (fb != NULL && fb->fGoneCall != NULL) {
++		thread_call_enter(fb->fGoneCall);
++	}
++}
++
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
+@@ -2536,9 +2649,20 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		return false;           /* the MDP scans the surface itself: it stays held */
+ 	}
++	SweetSurface *lastSurf = NULL;
+ 	IOLockLock(fLock);
+ 	fLastVA = NULL;
++	if (fFlip[0] != NULL) {
++		/*
++		 * 0417: directPresent()'s surface goes with fLastVA: with flip buffers it was copied (flipFrom()), never scanned,
++		 * and nothing reads it now. It stayed retained (a 3x screen surface, ~10 MB contiguous) until the next
++		 * directPresent(). Without flip buffers the MDP scanned it: kept as before.
++		 */
++		lastSurf = fLastSurf;
++		fLastSurf = NULL;
++	}
+ 	IOLockUnlock(fLock);
++	OSSafeReleaseNULL(lastSurf);
+ 	uint64_t comp_t0 = mach_absolute_time();
+ 	/*
+ 	 * copy path (several layers): compose into the cached back buffer and
+@@ -2596,7 +2720,13 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (!(mask & (1u << layer)) || id == 0) {
+ 			continue;
+ 		}
+-		SweetSurface *s = sweet_surface_copy(id);
++		SweetSurface *s;
++		if (fGoneShow != NULL && fGoneShow->id == id) {
++			s = fGoneShow;          /* 0417: the frame on the panel of a surface out of the table (surfacesGone()) */
++			s->retain();
++		} else {
++			s = sweet_surface_copy(id);
++		}
+ 		if (sweet_fb_swaps_logged < 16) {
+ 			sweet_fb_swaps_logged++;
+ 			IOLog("SWEET FB: swap %u layer %u surface %u %ux%u fmt 0x%x bpr %u a %d,%d %ux%u b %d,%d %dx%d\n",
+@@ -4670,12 +4800,18 @@ static int
+ sweet_fb_scanout_diag_sysctl SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(oidp, arg1, arg2)
+-	char buf[3072];                 /* 0354: (eight slots described) */
++	char buf[4096];                 /* 0354: (eight slots described); 0417: (and its line) */
+ 	size_t off = 0;
+ 	AppleCLCD *fb = sweet_frame_fb;
+ 	uint32_t used = 0, slots = 0;
+ 	uint64_t made = 0, refused = 0;
+ 
++	/*
++	 * 0417: a reading reaps the GPU's buffers left (closed, fence done) of every client first, and has the framebuffer
++	 * look for what it holds of surfaces no program has: the census shows what is still held after that.
++	 */
++	(void)sapphire_gpu_reap_all(1);
++	sweet_fb_surface_gone();
+ 	sweet_scanout_pool_census(&used, &slots, &made, &refused);
+ 	buf[0] = 0;
+ 	SWEET_FBD_CAT("scanout (kern.sweet_fb_scanout %d): %s; plane now %s, scaler %#x; CTL_FLUSH read its bits back right after "
+@@ -4690,6 +4826,15 @@ sweet_fb_scanout_diag_sysctl SYSCTL_HANDLER_ARGS
+ 	if (off + 1 < sizeof(buf)) {
+ 		off += sweet_scanout_pool_describe(buf + off, sizeof(buf) - off);  /* 0354: what is in each slot */
+ 	}
++	{
++		uint64_t gl[6], reclaimed = 0, refused_after = 0;
++		sapphire_gpu_left_census(gl);
++		sweet_scanout_pool_reclaims(&reclaimed, &refused_after);
++		SWEET_FBD_CAT("0417: GPU buffers of surfaces freed at their fence %llu (by the timer %llu in %llu runs, before a refusal "
++		    "%llu, at a reading %llu), still waiting %llu; pool full: a slot after reaping %llu, refused even so %llu; "
++		    "framebuffer: looks %llu, swaps kept while off let go %llu, frames on the panel shown again by the copy %llu\n",
++		    gl[0], gl[1], gl[4], gl[2], gl[3], gl[5], reclaimed, refused_after, sweet_fbg.looks, sweet_fbg.pend, sweet_fbg.shown);
++	}
+ 	if (fb != NULL) {
+ 		uint32_t nb = 0;
+ 		for (uint32_t i = 0; i < 8; i++) {
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 9f6a86c..affdd9c 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -203,6 +203,9 @@ static uint64_t sweet_pool_made, sweet_pool_refused, sweet_pool_ubwc_to_linear;
+ static SweetSurface *sweet_pool_owner[32];      /* 0354: the surface in each slot (not retained), sweet_surface_lock */
+ extern "C" int sweet_fb_ubwc_on(void);
+ extern "C" int sapphire_gpu_ubwc_mode(void);
++extern "C" uint32_t sapphire_gpu_reap_all(int why);    /* 0417: SapphireGpu.cpp */
++extern "C" void sweet_fb_surface_gone(void);            /* 0417: SweetFramebuffer.cpp */
++static uint64_t sweet_pool_reclaimed, sweet_pool_refused_after;   /* 0417: slots found after reaping, and not */
+ 
+ void
+ sweet_scanout_pool_set(uint64_t pa, uint32_t slots, uint32_t slot_size, uint32_t width, uint32_t height)
+@@ -223,6 +226,14 @@ sweet_scanout_pool_census(uint32_t *used, uint32_t *slots, uint64_t *made, uint6
+ 	*refused = sweet_pool_refused;
+ }
+ 
++/* sapphire 0417 (see SweetSurface.h) */
++void
++sweet_scanout_pool_reclaims(uint64_t *reclaimed, uint64_t *refused_after)
++{
++	*reclaimed = sweet_pool_reclaimed;
++	*refused_after = sweet_pool_refused_after;
++}
++
+ static bool
+ sweet_pool_eligible(const SweetSurface *s)
+ {
+@@ -483,7 +494,16 @@ sweet_surface_put(SweetSurface *s)
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	if (drop) {
++		/*
++		 * 0417: a surface of the scanout pool that no program has any more: the framebuffer lets go of what it holds of
++		 * it and does not need (a swap kept while the display is off; the frame on the panel, shown again by the copy
++		 * so that the panel reads a flip buffer). It only looks, from a thread call: nothing is taken here.
++		 */
++		bool pool = s->lowPool;
+ 		s->release();
++		if (pool) {
++			sweet_fb_surface_gone();
++		}
+ 	}
+ }
+ 
+@@ -1072,6 +1092,22 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		/* 0350: one of the window server's screen surfaces, from the framebuffer's scanout pool */
+ 		static uint32_t pool_told;
+ 		int slot = sweet_pool_alloc_slot();
++		if (slot < 0) {
++			/*
++			 * 0417: full: the GPU's buffers of surfaces no program has, closed and done, are freed first (each client's
++			 * waited for its next submission), and the framebuffer looks for what it holds of such surfaces (that frees a
++			 * slot a refresh later, for the next one).
++			 */
++			if (sapphire_gpu_reap_all(0) != 0) {
++				slot = sweet_pool_alloc_slot();
++			}
++			if (slot >= 0) {
++				sweet_pool_reclaimed++;
++			} else {
++				sweet_pool_refused_after++;
++				sweet_fb_surface_gone();
++			}
++		}
+ 		/*
+ 		 * 0408: compressed when its creator asked for it, as iOS does: QuartzCore asks before IOSurfaceCreate, through the
+ 		 * format -- '&BGA', lossless BGRA, for its framebuffers once CADeviceUseCompression holds (the ChipID table, then
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 8394eb2..286595d 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -127,6 +127,8 @@ void sweet_scanout_set_geometry(uint32_t w1, uint32_t h1, uint32_t w2, uint32_t
+  */
+ void sweet_scanout_pool_set(uint64_t pa, uint32_t slots, uint32_t slot_size, uint32_t width, uint32_t height);
+ void sweet_scanout_pool_census(uint32_t *used, uint32_t *slots, uint64_t *made, uint64_t *refused);
++/* sapphire 0417: surfaces given a slot after the GPU's buffers left were reaped (pool full), and refused even so */
++void sweet_scanout_pool_reclaims(uint64_t *reclaimed, uint64_t *refused_after);
+ int sweet_fb_scanout_pool_on(void);
+ /* sapphire 0354: one line per slot in use (surface, its IOSurfaceName, who made it, age, swaps); bytes written */
+ size_t sweet_scanout_pool_describe(char *buf, size_t len);
