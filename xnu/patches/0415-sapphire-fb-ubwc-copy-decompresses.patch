@@ -1,0 +1,286 @@
+xnu 0415: a frame of a UBWC surface that goes the copy's way is decompressed, not read as rows
+
+present()'s scaled copy read every surface as linear rows from its offset. A '&BGA' framebuffer of the pool is in the
+kernel's UBWC layout (flag buffer first, TILE6_3 data after it), so each of its frames that was copied instead of
+scanned out put the flag buffer and the compressed blocks on the panel: lines and pieces of the picture mixed with the
+previous frame. That happens whenever a surface of the window server's ring cannot be scanned out (0354, "frames
+copied for them": 1337 in 17 minutes on 2026-11-19, with the pool full), when a surface is swapped again while on the
+panel, and when the scanout is turned off.
+
+The copy now reads such a surface as Turnip's r2d_src reads a UBWC view: SP_PS_2D_SRC_INFO with TILE6_3, FLAGS and
+WZYX, SP_PS_2D_SRC_FLAGS with the flag buffer and its pitch, the whole rectangle in GRAS_A2D_SRC_* (a tiled source is
+not cropped by its address), and the destination in WXYZ so that the flip buffer holds B,G,R,A as the plane scans it.
+The unscaled copy does not take a UBWC surface at all. kern.sweet_fb_ubwc_diag counts the decompressed copies.
+
+The pool's census (kern.sweet_fb_scanout_diag) also says, for each slot, whether a program still has the surface (in
+the table), the references the kernel holds on it, and how many GPU buffers are open over it and by which process: on
+2026-11-19 three slots of eight belonged to framebuffers no program had any more, and the ring's new one went linear.
+---
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index 987b890..f136ee7 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -166,6 +166,7 @@ extern "C" int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, ui
+ #define REG_RB_A2D_DEST_BUFFER_INFO 0x8c17      /* + BASE (64-bit) at 0x8c18, PITCH at 0x8c1a */
+ #define REG_RB_A2D_CLEAR_COLOR_DW0  0x8c2c      /* DW0..DW3 */
+ #define REG_TPL1_A2D_SRC_TEXTURE_INFO 0xb4c0    /* + SIZE 0xb4c1, BASE (64-bit) 0xb4c2, PITCH 0xb4c4 */
++#define REG_SP_PS_2D_SRC_FLAGS      0xb4ca      /* 0415: flag buffer (64-bit), + FLAGS_PITCH 0xb4cc (a6xx.xml) */
+ #define REG_GRAS_A2D_SRC_XMIN       0x8401      /* + XMAX, YMIN, YMAX: coordinate << 8 */
+ #define REG_GRAS_A2D_BLT_CNTL       0x8400
+ #define REG_GRAS_A2D_DEST_TL        0x8405      /* + BR at 0x8406 */
+@@ -2595,10 +2596,10 @@ blit_begin(uint32_t rgba)
+ 
+ /* One rectangle [x0, x1] x [y0, y1] of a linear surface: base 64-byte aligned, pitch a multiple of 64. */
+ static void
+-blit_rect(uint64_t base, uint32_t pitch, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
++blit_rect(uint64_t base, uint32_t pitch, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1, uint32_t swap = 0)
+ {
+ 	emit(pkt4(REG_RB_A2D_DEST_BUFFER_INFO, 4));
+-	emit(FMT6_8_8_8_8_UNORM);                   /* TILE6_LINEAR, WZYX */
++	emit(FMT6_8_8_8_8_UNORM | (swap << 10));    /* TILE6_LINEAR, COLOR_SWAP (0 WZYX; 0415: 1 WXYZ after a UBWC source) */
+ 	emit((uint32_t)base);
+ 	emit((uint32_t)(base >> 32));
+ 	emit(pitch >> 6);
+@@ -2781,6 +2782,57 @@ blit_scale(uint64_t src, uint32_t spitch, uint32_t sx, uint32_t sy, uint32_t sw,
+ 	return blit_end("scale");
+ }
+ 
++/*
++ * sapphire 0415: blit_scale() from a surface in the kernel's UBWC layout (SweetSurface.cpp, sweet_pool_ubwc_layout(): flag
++ * buffer at meta, TILE6_3 data at data). The 2D engine reads it as Turnip's r2d_src does over a UBWC view
++ * (tu_clear_blit.cc; fdl6_view_init's SP_PS_2D_SRC_INFO): TILE6_3, FLAGS, the flag buffer and its pitch in
++ * SP_PS_2D_SRC_FLAGS, and WZYX, the order a tiled layout keeps every 8-bit format in. The destination's WXYZ (the swap of
++ * B8G8R8A8, fd6_format_table.c) puts the window server's B,G,R,A back into the flip buffer, which the plane scans as
++ * BGRA. A tiled source cannot be cropped by its address as blit_scale() does: the base stays the data's start and the
++ * whole rectangle goes into GRAS_A2D_SRC_*.
++ */
++static bool
++blit_scale_ubwc(uint64_t data, uint32_t dpitch_src, uint64_t meta, uint32_t mpitch, uint32_t width, uint32_t height,
++    uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh, uint64_t dst, uint32_t dpitch, uint32_t dw, uint32_t dh)
++{
++	uint32_t k = (dpitch & 63) == 0 ? 1 : 2;
++
++	if ((dpitch_src & 63) != 0 || (mpitch & 63) != 0 || (mpitch >> 6) > 0xff || (data & 4095) != 0 || (meta & 63) != 0 ||
++	    ((k * dpitch) & 63) != 0 || (dst & 3) != 0 || dw == 0 || dh == 0 || sw == 0 || sh == 0 || width == 0 || height == 0 ||
++	    width > 0x7fff || height > 0x7fff || dw + 16 > 0x4000 || ((sx + sw) >> 8) > width || ((sy + sh) >> 8) > height) {
++		LOG("  blit_scale_ubwc: pitches %u/%u/%u or sizes do not fit the blitter", dpitch_src, mpitch, dpitch);
++		return false;
++	}
++	blit_setup(false, 0);
++	for (uint32_t j = 0; j < k && j < dh; j++) {
++		uint64_t d0 = dst + (uint64_t)j * dpitch;
++		uint32_t dx = (uint32_t)(d0 & 63) / 4, n = (dh - j + k - 1) / k;
++		int64_t span = (int64_t)sh * k * n / dh;
++		int64_t y0 = (int64_t)sy + ((2 * (int64_t)j + 1 - (int64_t)k) * (int64_t)sh) / (2 * (int64_t)dh);
++		if (y0 < 0) {
++			y0 = 0;
++		}
++		emit(pkt4(REG_TPL1_A2D_SRC_TEXTURE_INFO, 5));        /* INFO, SIZE, BASE lo/hi, PITCH */
++		emit(FMT6_8_8_8_8_UNORM | (3u << 8) | (1u << 12) | (1u << 16) | (1u << 20) | (1u << 22));  /* TILE6_3, WZYX, FLAGS, FILTER */
++		emit(width | (height << 15));
++		emit((uint32_t)data);
++		emit((uint32_t)(data >> 32));
++		emit((dpitch_src >> 6) << 9);
++		emit(pkt4(REG_SP_PS_2D_SRC_FLAGS, 3));                 /* FLAGS lo/hi, FLAGS_PITCH (64-byte units) */
++		emit((uint32_t)meta);
++		emit((uint32_t)(meta >> 32));
++		emit(mpitch >> 6);
++		emit(pkt4(REG_GRAS_A2D_SRC_XMIN, 4));
++		emit(sx);
++		emit(sx + sw - 256);
++		emit((uint32_t)y0);
++		emit((uint32_t)(y0 + span - 256));
++		blit_rect(d0 & ~63ull, k * dpitch, dx, 0, dx + dw - 1, n - 1, 1 /* WXYZ */);
++	}
++	/* the next linear copy must not find the flag buffer on: blit_copy() and blit_scale() leave FLAGS clear in INFO */
++	return blit_end("scale-ubwc");
++}
++
+ /*
+  * boot-arg gpu_bench=1: is the GPU worth handing AppleCLCD's per-frame copy? That copy is a
+  * full 1080 x 2400 frame (10 MB) from CoreAnimation's surface into the flip buffer, memcpy then a
+@@ -3427,6 +3479,58 @@ sapphire_gpu_copy_scaled(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src
+ 	return ok;
+ }
+ 
++/* 0415: sapphire_gpu_copy_scaled() of a surface in the kernel's UBWC layout: blit_scale_ubwc() */
++bool sapphire_gpu_copy_scaled_ubwc(IOMemoryDescriptor *src, uint64_t data_off, uint32_t data_pitch, uint64_t meta_off,
++    uint32_t meta_pitch, uint32_t width, uint32_t height, uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh, uint64_t dst_pa,
++    uint32_t dst_pitch, uint32_t dw, uint32_t dh, uint64_t dst_base, uint64_t dst_size);
++
++bool
++sapphire_gpu_copy_scaled_ubwc(IOMemoryDescriptor *src, uint64_t data_off, uint32_t data_pitch, uint64_t meta_off,
++    uint32_t meta_pitch, uint32_t width, uint32_t height, uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh, uint64_t dst_pa,
++    uint32_t dst_pitch, uint32_t dw, uint32_t dh, uint64_t dst_base, uint64_t dst_size)
++{
++	static uint32_t told;
++	bool ok = false;
++	uint64_t last = data_off + (uint64_t)((height + 15) & ~15u) * data_pitch;
++
++	if (!service_ready || src == NULL || dw == 0 || dh == 0) {
++		return false;
++	}
++	uint64_t diag_t0 = mach_absolute_time();
++	IOLockLock(service_lock);
++	gdiag_since(&gdiag.copy_lock, diag_t0);
++	if (service_ready) {
++		uint64_t va = map_window(src);
++		bool dst_ok = map_identity(dst_base, dst_size);
++		if (!ring_room(1024, 200)) {
++			LOG("service: the ring stays full (the GPU stopped?): copy refused");
++			IOLockUnlock(service_lock);
++			return false;
++		}
++		if (va != 0 && dst_ok && last <= src->getLength() && meta_off < data_off) {
++			uint32_t mark = gdiag_copy_begin();
++			ok = blit_scale_ubwc(va + data_off, data_pitch, va + meta_off, meta_pitch, width, height, sx, sy, sw, sh, dst_pa,
++			    dst_pitch, dw, dh);
++			gdiag_copy_end(mark);
++			uint32_t wi = (uint32_t)((va - WIN_BASE) / WIN_SIZE);
++			if (wi < WIN_COUNT) {
++				win[wi].fence = fence_seq;
++			}
++			last_copy_fence = fence_seq;
++			if (!ok && told++ < 4) {
++				/* refused before anything was emitted (blit_scale_ubwc() checks first): the GPU path stays on */
++				LOG("service: a UBWC copy was refused (%ux%u, data pitch %u, meta pitch %u)", width, height, data_pitch,
++				    meta_pitch);
++			}
++		} else if (told++ < 4) {
++			LOG("service: cannot map this UBWC copy (window %llx, destination %s, %ux%u of %llu bytes)", va,
++			    dst_ok ? "ok" : "NOT mapped", width, height, src->getLength());
++		}
++	}
++	IOLockUnlock(service_lock);
++	return ok;
++}
++
+ /*
+  * boot-arg gpu_cs=1: the first shader on the Adreno — a compute kernel of 64 invocations, each
+  * storing 0xc0de0000 + its local invocation id at buf[id], the buffer's GPU address in c0.xy.
+@@ -6383,6 +6487,7 @@ SapphireGPUClient::freeBo(struct msm_bo *b)
+ 	msm_mark((b->va - MSM_VA_START) >> 12, n, false);
+ 	if (b->surf != NULL) {
+ 		b->md->complete();
++		OSDecrementAtomic(&b->surf->gpuBos);   /* 0415 */
+ 		b->surf->release();
+ 	}
+ 	if (b->user) {
+@@ -6823,6 +6928,8 @@ SapphireGPUClient::surface(struct msm_surface *r)
+ 			fBytes += size;
+ 			msm_census(b, 1);
+ 			r->handle = h;
++			OSIncrementAtomic(&s->gpuBos);  /* 0415: (the pool's census) */
++			proc_selfname(s->gpuBy, sizeof(s->gpuBy));
+ 			s = NULL;                       /* the buffer keeps the reference */
+ 			ret = kIOReturnSuccess;
+ 		} else {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 0d03ebf..23b1b5e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -507,6 +507,7 @@ sweet_fbl_sample(volatile uint32_t *ctl, volatile uint32_t *intf)
+ static int sweet_fb_scanout = 1;                /* 0405: on by default (boot-arg sweetfb_scanout=0 turns it off) */
+ static int sweet_fb_ubwc = 1;                    /* 0405: on by default with direct scanout and a GPU UBWC mode (sweetfb_ubwc=0: off) */
+ static uint64_t sweet_fb_ubwc_flips, sweet_fb_ubwc_errors;
++static uint64_t sweet_fb_ubwc_copies;             /* 0415: frames of a UBWC surface copied (decompressed) into a flip buffer */
+ static uint32_t sweet_fb_ubwc_last_error;
+ /*
+  * 0401: what the plane and the MDSS are given for UBWC, as the phone's Android programs them (read with sde_reg on
+@@ -2357,6 +2358,9 @@ extern bool sapphire_gpu_copy(IOMemoryDescriptor *src, uint64_t src_off, uint32_
+ extern bool sapphire_gpu_copy_scaled(IOMemoryDescriptor *src, uint64_t src_off, uint32_t src_pitch, uint32_t sx,
+     uint32_t sy, uint32_t sw, uint32_t sh, uint64_t dst_pa, uint32_t dst_pitch, uint32_t dw, uint32_t dh,
+     uint64_t dst_base, uint64_t dst_size);
++extern bool sapphire_gpu_copy_scaled_ubwc(IOMemoryDescriptor *src, uint64_t data_off, uint32_t data_pitch, uint64_t meta_off,
++    uint32_t meta_pitch, uint32_t width, uint32_t height, uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh, uint64_t dst_pa,
++    uint32_t dst_pitch, uint32_t dw, uint32_t dh, uint64_t dst_base, uint64_t dst_size);     /* 0415 */
+ extern bool sapphire_gpu_ready(void);
+ extern "C" void sweet_dcache_flush(vm_offset_t addr, unsigned length);  /* osfmk/arm/caches.c */
+ 
+@@ -2635,10 +2639,25 @@ AppleCLCD::present(const uint8_t *rec)
+ 						sweet_fb_ids[sweet_fb_ids_next++ & 3] = sid;
+ 					}
+ 				}
+-				shown = sapphire_gpu_copy_scaled(s->memory, s->offset, s->bytesPerRow,
+-				    (uint32_t)((uint64_t)fOffX * kx / SWEET_FB_LOGICAL_W), (uint32_t)((uint64_t)fOffY * ky / SWEET_FB_LOGICAL_H),
+-				    (uint32_t)((uint64_t)fWidth * kx / SWEET_FB_LOGICAL_W), (uint32_t)((uint64_t)fHeight * ky / SWEET_FB_LOGICAL_H),
+-				    dbase, fRowBytes, fWidth, fHeight, dbase, (uint64_t)fRowBytes * fHeight);
++				uint32_t csx = (uint32_t)((uint64_t)fOffX * kx / SWEET_FB_LOGICAL_W);
++				uint32_t csy = (uint32_t)((uint64_t)fOffY * ky / SWEET_FB_LOGICAL_H);
++				uint32_t csw = (uint32_t)((uint64_t)fWidth * kx / SWEET_FB_LOGICAL_W);
++				uint32_t csh = (uint32_t)((uint64_t)fHeight * ky / SWEET_FB_LOGICAL_H);
++				if (s->ubwc) {
++					/*
++					 * 0415: a surface in the kernel's UBWC layout (a '&BGA' framebuffer of the pool) is decompressed by the
++					 * copy. Read as rows from its offset, the copy put its flag buffer and compressed blocks on the panel:
++					 * lines and pieces of the picture among the frames of a ring whose other surface is copied (0354, held
++					 * off), of a surface swapped again while on the panel, or after the scanout is turned off.
++					 */
++					shown = sapphire_gpu_copy_scaled_ubwc(s->memory, s->ubwcDataOffset, s->ubwcDataStride, s->ubwcMetaOffset,
++					    s->ubwcMetaStride, s->width, s->height, csx, csy, csw, csh, dbase, fRowBytes, fWidth, fHeight, dbase,
++					    (uint64_t)fRowBytes * fHeight);
++					sweet_fb_ubwc_copies += shown;
++				} else {
++					shown = sapphire_gpu_copy_scaled(s->memory, s->offset, s->bytesPerRow, csx, csy, csw, csh,
++					    dbase, fRowBytes, fWidth, fHeight, dbase, (uint64_t)fRowBytes * fHeight);
++				}
+ 				if (shown) {
+ 					if (fFlip[0] != NULL && sweet_fb_flipflush) {
+ 						sweet_dcache_flush((vm_offset_t)dst, (unsigned)((uint64_t)fHeight * fRowBytes));
+@@ -2691,8 +2710,8 @@ AppleCLCD::present(const uint8_t *rec)
+ 		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+ 		    (uint64_t)(sx + w) * 4;
+ 		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+-		    s->memory == NULL || last > s->memory->getLength()) {
+-			src = 0;
++		    s->memory == NULL || last > s->memory->getLength() || s->ubwc) {
++			src = 0;                /* 0415: a UBWC layout is not rows: not copied this way (the panel keeps its frame) */
+ 		}
+ 		if (src != 0 && bpe == 4 && gpu_frame) {
+ 			uint64_t soff = s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
+@@ -4748,9 +4767,9 @@ sweet_fb_ubwc_diag_sysctl SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(oidp, arg1, arg2)
+ 	char line[192];
+-	snprintf(line, sizeof(line), "ubwc %d flips %llu errors %llu last %#x mdss_static %#x gpu_mode %d\n", sweet_fb_ubwc,
++	snprintf(line, sizeof(line), "ubwc %d flips %llu errors %llu last %#x mdss_static %#x gpu_mode %d copies %llu\n", sweet_fb_ubwc,
+ 	    sweet_fb_ubwc_flips, sweet_fb_ubwc_errors, sweet_fb_ubwc_last_error,
+-	    sweet_fbr_va[0] != NULL ? sweet_fbr_va[0][0x144 / 4] : 0, sapphire_gpu_ubwc_mode());
++	    sweet_fbr_va[0] != NULL ? sweet_fbr_va[0][0x144 / 4] : 0, sapphire_gpu_ubwc_mode(), sweet_fb_ubwc_copies);
+ 	return SYSCTL_OUT(req, line, strlen(line) + 1);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_ubwc_diag, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 8f1af52..10bf9da 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -353,9 +353,13 @@ sweet_scanout_pool_describe(char *buf, size_t len)
+ 		if (s->swapAbs != 0) {
+ 			absolutetime_to_nanoseconds(now - s->swapAbs, &swap_ns);
+ 		}
+-		int n = snprintf(buf + off, len - off, "  slot %u: surface %u \"%s\" by %s, %s, made %llu s ago, swapped %u times%s",
++		/* 0415: whether a program still has it (in the table), the references the kernel holds, and the GPU buffers over it */
++		int n = snprintf(buf + off, len - off, "  slot %u: surface %u \"%s\" by %s, %s, %s, refs %d, GPU buffers %d (last by %s), "
++		    "made %llu s ago, swapped %u times%s",
+ 		    i, s->id, name != NULL ? name->getCStringNoCopy() : "", s->creator,
+-		    s->ubwc ? (s->ubwcSettled ? "UBWC" : "UBWC until taken") : "linear", age_ns / NSEC_PER_SEC, s->swaps,
++		    s->ubwc ? (s->ubwcSettled ? "UBWC" : "UBWC until taken") : "linear",
++		    s->id < SWEET_SURFACE_MAX_ID && sweet_surface_table[s->id] == s ? "in the table" : "NOT in the table",
++		    s->getRetainCount(), (int)s->gpuBos, s->gpuBy[0] != 0 ? s->gpuBy : "-", age_ns / NSEC_PER_SEC, s->swaps,
+ 		    s->swapAbs != 0 ? ", last " : "\n");
+ 		if (n > 0) {
+ 			off = off + (size_t)n < len ? off + (size_t)n : len - 1;
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 34fa9c1..8394eb2 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -85,6 +85,9 @@ public:
+ 	uint64_t                  madeAbs;
+ 	uint32_t                  swaps;
+ 	uint64_t                  swapAbs;
++	/* 0415: GPU buffers open over it (SapphireGPUClient::surface()), and the process that opened the last one */
++	volatile SInt32           gpuBos;
++	char                      gpuBy[20];
+ 	/* 0398: shared display UBWC layout; only pool surfaces may set this. */
+ 	bool                      ubwc;
+ 	bool                      ubwcSettled;             /* 0407: the GPU or the processor has taken it */
