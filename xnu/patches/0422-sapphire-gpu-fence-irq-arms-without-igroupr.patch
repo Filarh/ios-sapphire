@@ -1,0 +1,127 @@
+xnu 0422: the GPU's fence interrupt arms (no GICD_IGROUPR test), and kern.sweet_gpu_irq_stats says why it does not
+
+Tried on the phone (CI 44667274924): kern.sweet_gpu_wait=2 never arms. kern.sweet_gpu_irq_stats: "interrupt off;
+interrupts 0; armed 0 times", and the waits stay in the back-off. girq_arm() (0419) returned false before touching
+anything: the gpu and gicd mappings are made unconditionally at the GPU's bring-up and the service runs, so the false
+is its third test, (GICD_IGROUPR6 & bit 17) == 0. With two security states (GICD_CTLR.DS = 0) GICD_IGROUPR<n> is
+RAZ/WI to non-secure accesses (GICv3 architecture; pe_fiq.c notes the same of GICR_IGROUPR0), so it reads 0 for every
+line, ours or not. kgsl takes this same line, SPI 177, from Android's non-secure kernel.
+
+girq_arm() no longer reads GICD_IGROUPR. To tell a line of ours from a Secure one it uses what the non-secure side
+can see: with the line disabled and its pending state cleared (as 0419 did first), it writes IPRIORITYR 0xA0 and reads
+it back; a Secure line's IPRIORITYR is RAZ/WI to non-secure accesses, so a 0 leaves the line alone ("a Secure line,
+not ours"). Otherwise the arming goes on exactly as in 0419 (hook, RBBM mask 0 and clear, ICFGR level, IROUTER, the
+mask's bit 20, ISENABLER).
+
+kern.sweet_gpu_irq_stats gets a second line: "armed", or "not armed: <why>" (gicd NULL, gpu NULL, the priority read
+back 0, the service not up yet, never asked), and the line as the distributor shows it to this side: GICD_CTLR,
+IGROUPR bit and word, ISENABLER, ISPENDR, ISACTIVER, IPRIORITYR (now and as read back at the last arming), ICFGR and
+IROUTER of INTID 209. Nothing else changes: kern.sweet_gpu_wait 0 and 1 behave as in 0419.
+
+Expected [not measured]: kern.sweet_gpu_wait=2 now arms; the stats show "armed", interrupts with CACHE_FLUSH_TS, and
+waits woken by the interrupt. The risk of 0419's mode 2 (a level line held by a handler that cannot clear it) now
+applies for real: try it in place first, not by boot-arg.
+---
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index 7433deb..61a85cd 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -5816,6 +5816,8 @@ static struct {
+ 	uint64_t irqs, ts, other, empty, stray, wake_irq, wake_net, arms, disarms;
+ 	uint32_t last_status, empty_run;
+ 	bool broken;
++	const char *why;                        /* 0422: why the last arming did not arm (NULL: it did, or none tried) */
++	uint32_t prio_read;                     /* 0422: IPRIORITYR of the line read back at the last arming */
+ } girq;
+ 
+ extern "C" bool (*volatile sweet_spi_hook)(uint32_t intid);    /* osfmk/arm64/sleh.c, SWEET */
+@@ -5871,19 +5873,35 @@ girq_arm(void)
+ 	if (girq_armed) {
+ 		return true;
+ 	}
+-	if (gicd == NULL || gpu == NULL) {
++	if (gicd == NULL) {
++		girq.why = "the distributor is not mapped (gicd NULL)";
+ 		return false;
+ 	}
+-	if ((rd(gicd, GICD_IGROUPR + GPU_INT_WORD) & GPU_INT_BIT) == 0) {
+-		LOG("0419: SPI 177 is Group 0 in the distributor (TrustZone's): the fence interrupt is not armed");
++	if (gpu == NULL) {
++		girq.why = "the GPU's registers are not mapped (gpu NULL)";
+ 		return false;
+ 	}
+-	sweet_spi_hook = gpu_spi;
+-	gwr(REG_RBBM_INT_0_MASK, 0);
+-	gwr(REG_RBBM_INT_CLEAR_CMD, 0xFFFFFFFF);
++	/*
++	 * 0422: GICD_IGROUPR is not looked at any more. With two security states (GICD_CTLR.DS 0, as here) it is RAZ/WI
++	 * to non-secure accesses (GICv3 architecture, GICD_IGROUPR<n>; pe_fiq.c says the same of GICR_IGROUPR0), so 0419
++	 * read 0 for every line and never armed. What tells a line of ours from a Secure one from this side is that a
++	 * Secure line's IPRIORITYR is RAZ/WI to non-secure accesses: the priority is written with the line disabled and
++	 * read back, and a 0 leaves it alone. (kgsl takes this same line from the non-secure kernel.)
++	 */
+ 	wr(gicd, GICD_ICENABLER + GPU_INT_WORD, GPU_INT_BIT);
+ 	wr(gicd, GICD_ICPENDR + GPU_INT_WORD, GPU_INT_BIT);
+ 	*(volatile uint8_t *)(gicd + GICD_IPRIORITYR + GPU_INTID) = 0xA0;       /* as pe_fiq.c gives the SGIs and PPIs */
++	gmb();
++	girq.prio_read = *(volatile uint8_t *)(gicd + GICD_IPRIORITYR + GPU_INTID);
++	if (girq.prio_read == 0) {
++		girq.why = "SPI 177's IPRIORITYR reads 0 after writing 0xA0: a Secure line, not ours";
++		LOG("0419: %s", girq.why);
++		return false;
++	}
++	girq.why = NULL;
++	sweet_spi_hook = gpu_spi;
++	gwr(REG_RBBM_INT_0_MASK, 0);
++	gwr(REG_RBBM_INT_CLEAR_CMD, 0xFFFFFFFF);
+ 	rmw(gicd, GICD_ICFGR + 4u * (GPU_INTID / 16u), 2u << (2u * (GPU_INTID % 16u)), 0);      /* level */
+ 	gmb();
+ 	*(volatile uint64_t *)(gicd + GICD_IROUTER + 8u * GPU_INTID) = gpu_irq_mpidr & 0xFF00FFFFFFull;  /* Aff3..0, IRM 0 */
+@@ -6019,6 +6037,9 @@ sweet_gpu_wait_sysctl SYSCTL_HANDLER_ARGS
+ 	}
+ 	if (service_lock == NULL || !service_ready) {
+ 		gpu_wait_mode = v;                      /* taken at the service's start */
++		if (v == 2) {
++			girq.why = "the GPU service is not up: armed when it starts";      /* 0422 */
++		}
+ 		return 0;
+ 	}
+ 	IOLockLock(service_lock);
+@@ -6041,14 +6062,35 @@ static int
+ sweet_gpu_irq_stats_sysctl SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(oidp, arg1, arg2)
+-	char line[384];
++	char line[768];
++	int n;
+ 
+-	snprintf(line, sizeof(line), "fence wait (kern.sweet_gpu_wait %d, max %d us, net %d us): interrupt %s%s; "
++	n = snprintf(line, sizeof(line), "fence wait (kern.sweet_gpu_wait %d, max %d us, net %d us): interrupt %s%s; "
+ 	    "interrupts %llu (CACHE_FLUSH_TS %llu, other bits %llu, empty %llu, stray %llu, last status %08x); "
+ 	    "waits woken by it %llu, by the net %llu; armed %llu times, disarmed %llu; wait loops %llu in %llu waits\n",
+ 	    gpu_wait_mode, gpu_wait_max_us, gpu_wait_irq_us, girq_armed ? "armed" : "off", girq.broken ? " (broken)" : "",
+ 	    girq.irqs, girq.ts, girq.other, girq.empty, girq.stray, girq.last_status, girq.wake_irq, girq.wake_net,
+ 	    girq.arms, girq.disarms, gdiag.wait_loops, gdiag.wait_n);
++	/* 0422: why it is not armed, and the line as the distributor shows it to this side */
++	if (n > 0 && (size_t)n < sizeof(line)) {
++		if (gicd != NULL) {
++			snprintf(line + n, sizeof(line) - (size_t)n, "%s%s; GICD_CTLR %08x, SPI 177 (INTID 209): IGROUPR %u "
++			    "(word %08x; RAZ to non-secure with two security states), ISENABLER %u, ISPENDR %u, ISACTIVER %u, "
++			    "IPRIORITYR %02x (read back at the last arming %02x), ICFGR %u, IROUTER %016llx\n",
++			    girq_armed ? "armed" : "not armed: ", girq_armed ? "" : (girq.why != NULL ? girq.why :
++			    "never asked (kern.sweet_gpu_wait=2 arms it)"), rd(gicd, 0),
++			    (rd(gicd, GICD_IGROUPR + GPU_INT_WORD) & GPU_INT_BIT) != 0, rd(gicd, GICD_IGROUPR + GPU_INT_WORD),
++			    (rd(gicd, GICD_ISENABLER + GPU_INT_WORD) & GPU_INT_BIT) != 0,
++			    (rd(gicd, GICD_ISPENDR + GPU_INT_WORD) & GPU_INT_BIT) != 0,
++			    (rd(gicd, GICD_ISACTIVER + GPU_INT_WORD) & GPU_INT_BIT) != 0,
++			    *(volatile uint8_t *)(gicd + GICD_IPRIORITYR + GPU_INTID), girq.prio_read,
++			    (rd(gicd, GICD_ICFGR + 4u * (GPU_INTID / 16u)) >> (2u * (GPU_INTID % 16u))) & 3u,
++			    *(volatile uint64_t *)(gicd + GICD_IROUTER + 8u * GPU_INTID));
++		} else {
++			snprintf(line + n, sizeof(line) - (size_t)n, "not armed: %s\n", girq.why != NULL ? girq.why :
++			    "the distributor is not mapped (gicd NULL)");
++		}
++	}
+ 	return SYSCTL_OUT(req, line, strlen(line) + 1);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_irq_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
