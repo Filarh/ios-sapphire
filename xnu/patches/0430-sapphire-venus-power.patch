@@ -1,0 +1,452 @@
+xnu 0430: the video block (Venus AR50 Lite), phase 1: power and clocks, by sysctl
+
+bsd/dev/sweet_venus.c. Nothing runs at boot. kern.sweet_venus = 1 powers the block up in the order of Qualcomm's
+driver (msm_vidc_ar50lt.c:496-561; Linux iris/iris_vpu_ar50lt.c:56-118): GDSC venus, GPLL11 configured (gcc-khaje.c
+gpll11_config, clk_trion_pll_configure) and started (clk_trion_pll_enable), gcc_video_venus_clk_src at 133.33 MHz
+(GPLL11 / 4.5), core, iface and bus clocks, GDSC vcodec0, core0, core0_bus and throttle clocks; then it reads
+WRAPPER_HW_VERSION and WRAPPER_CORE_POWER_STATUS and measures the two core clocks with the GCC debug mux. 2 powers it
+down in reverse. kern.sweet_venus_log has the steps; each risky step is logged and synced to the partition first.
+Phase 0 read on the phone (2026-11-20): both GDSCs collapsed, GPLL11 unconfigured (L 0, OPMODE 0), the RCG off on XO,
+the six branches off. No CX vote: the GPU holds CX at 416, above the 64 that 133.33 MHz needs.
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 11eadd7..3e9ec95 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -119,6 +119,7 @@ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_vibrate.c			standard
+ bsd/dev/sweet_cam.c			standard
++bsd/dev/sweet_venus.c			standard
+ bsd/dev/sweet_bt.c			standard
+ bsd/dev/sweet_audio_ctl.c		standard
+ bsd/dev/sweet_audio_dev.c		standard
+diff --git a/bsd/dev/sweet_venus.c b/bsd/dev/sweet_venus.c
+new file mode 100644
+index 0000000..b269b49
+--- /dev/null
++++ b/bsd/dev/sweet_venus.c
+@@ -0,0 +1,423 @@
++/*
++ * sweet_venus.c: the SM6225's video block (Venus AR50 Lite), phase 1: power and clocks
++ * (dev-notes/investigacion/31-video-por-hardware.md; anexos/31-video/02-bloque-de-video-qualcomm.md §1.2-§1.3, §2.2, §5).
++ *
++ * Nothing runs at boot. kern.sweet_venus = 1 powers the block up in the order Qualcomm's driver does it
++ * (video-driver msm_vidc_ar50lt.c:496-561; Linux iris/iris_vpu_ar50lt.c:56-118): the controller's GDSC, GPLL11
++ * configured and started, the video RCG, the controller's three clocks; then the codec core's GDSC and its three
++ * clocks. It reads the wrapper's version and power status and measures the core clock with the GCC debug mux.
++ * kern.sweet_venus = 2 powers it down in the reverse order. Reading kern.sweet_venus gives the state (0 off, 1 on,
++ * negative: the step that failed); kern.sweet_venus_log the steps. Every step is logged and the log written to the
++ * partition before the next access (sweet_log_sync), so a panic says where it was.
++ *
++ * Values and where they come from (MiCode topaz-t-oss 345999da, same SoC; research/metal/relojes/ref/downstream):
++ *   GCC 0x1400000 (DT:6272-6283). GPLL11 at +0xb000, Lucid with the Trion register layout
++ *   (clk-alpha-pll.c:107-121), its 600 MHz configuration gcc-khaje.c:189-199, enable vote +0x79000 bit 11
++ *   (gcc-khaje.c:208-209); configure as clk_trion_pll_configure (clk-alpha-pll.c:1912-1966), enable as
++ *   clk_trion_pll_enable (clk-alpha-pll.c:1000-1030). gcc_video_venus_clk_src: CMD +0x58060, hid_width 5, source 1
++ *   = GPLL11 (gcc-khaje.c:794-805, 2004-2011), 133.33 MHz = GPLL11 / 4.5 (gcc-khaje.c:1993), the rate Qualcomm's
++ *   driver sets with no session (venus_hfi.c:721-742). Branches and GDSCs: anexo 31-video/02 §1.3 (gcc-khaje.c
++ *   3520-3640; DT:8426-8441). Debug mux selectors: debugcc-khaje.c:336-347. Venus registers 0x5a00000:
++ *   WRAPPER_HW_VERSION +0xb0000, WRAPPER_CORE_POWER_STATUS +0xb0090 (msm_vidc_ar50lt.c:20-148).
++ * The CX rail is not voted here: the GPU holds it at 416 (0337), above the 64 (LOW_SVS) 133.33 MHz needs
++ * (gcc-khaje.c:2015-2022), and there is no aggregator of votes (anexo 02 §3).
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/errno.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <stdarg.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void IODelay(unsigned microseconds);
++extern void sweet_log_sync(unsigned max_ms);            /* bsd/dev/sweet_ufs.c */
++extern uint32_t sapphire_clk_measure_khz(uint32_t sel);  /* SapphireGpu.cpp, 0361 */
++
++#define GCC_PA              0x01400000ull
++#define VENUS_PA            0x05a00000ull
++
++/* GCC, by page */
++#define GPLL11              0x0b000u
++#define PLL_MODE            0x00u
++#define PLL_L               0x04u
++#define PLL_CAL_L           0x08u
++#define PLL_USER_CTL        0x0cu
++#define PLL_USER_CTL_U      0x10u
++#define PLL_USER_CTL_U1     0x14u
++#define PLL_CONFIG_CTL      0x18u
++#define PLL_CONFIG_CTL_U    0x1cu
++#define PLL_CONFIG_CTL_U1   0x20u
++#define PLL_OPMODE          0x38u
++#define PLL_ALPHA           0x40u
++#define PLL_OUTCTRL         (1u << 0)
++#define PLL_RESET_N         (1u << 2)
++#define PLL_VOTE_FSM_ENA    (1u << 20)
++#define PLL_UPDATE_BYPASS   (1u << 23)
++#define PLL_FSM_LEGACY_MODE (1u << 24)
++#define PLL_ACTIVE_FLAG     (1u << 30)
++#define PLL_LOCK_DET        (1u << 31)
++#define PLL_OUT_MASK        0x7u                 /* main, even, odd outputs in USER_CTL (Trion) */
++#define PLL_RUN             1u
++#define PLL_STANDBY         0u
++
++#define VOTE_PLL            0x79000u             /* bit 11: gpll11 */
++#define VOTE_BRANCH         0x79004u             /* bit 28: gcc_video_throttle_core_clk */
++#define RCG_VENUS           0x58060u             /* CMD; CFG at +4 */
++#define GDSC_VENUS          0x5807cu
++#define GDSC_VCODEC0        0x58098u
++#define CBCR_VENUS_CTL      0x5808cu             /* core_clk */
++#define CBCR_VCODEC0_SYS    0x580a4u             /* core0_clk */
++#define CBCR_VIDEO_AHB      0x17004u             /* iface_clk */
++#define CBCR_THROTTLE       0x17068u             /* throttle_clk (voted) */
++#define CBCR_VENUS_CTL_AXI  0x6e004u             /* bus_clk */
++#define CBCR_VCODEC0_AXI    0x6e008u             /* core0_bus_clk */
++
++/* gpll11_config, gcc-khaje.c:189-199 (600 MHz = 19.2 MHz x (0x1F + 0x4000 / 2^16)) */
++#define GPLL11_L            0x1Fu
++#define GPLL11_CAL_L        0x44u
++#define GPLL11_ALPHA        0x4000u
++#define GPLL11_CONFIG       0x20485699u
++#define GPLL11_CONFIG_U     0x00002261u
++#define GPLL11_CONFIG_U1    0x329A299Cu
++#define GPLL11_USER         0x00000001u
++#define GPLL11_USER_U       0x00000805u
++
++/* ftbl_gcc_video_venus_clk_src: 133.33 MHz = source 1 (GPLL11) / 4.5; SRC_DIV = 2 x div - 1, SRC_SEL bits 10:8 */
++#define RCG_VENUS_133M      ((1u << 8) | 8u)
++
++/* debugcc-khaje.c gcc_debug_mux_sels */
++#define DBG_VIDEO_VENUS_CTL 0x148u
++#define DBG_VCODEC0_SYS     0x14Au
++
++/* Venus */
++#define WRAPPER_HW_VERSION          0xb0000u
++#define WRAPPER_CORE_POWER_STATUS   0xb0090u
++
++static vm_offset_t g_pll, g_ahb, g_venus, g_axi, g_vote, v_wrap;
++static int venus_state;
++static char venus_log[3072];
++static size_t venus_log_len;
++static lck_grp_t *venus_grp;
++static lck_mtx_t *venus_lock;
++
++static void
++vlog(const char *fmt, ...)
++{
++	char line[200];
++	va_list ap;
++	va_start(ap, fmt);
++	int n = vsnprintf(line, sizeof(line), fmt, ap);
++	va_end(ap);
++	if (n < 0) {
++		return;
++	}
++	printf("SWEET VENUS: %s\n", line);
++	if (venus_log_len + strlen(line) + 2 < sizeof(venus_log)) {
++		venus_log_len += (size_t)snprintf(venus_log + venus_log_len, sizeof(venus_log) - venus_log_len, "%s\n", line);
++	}
++}
++
++/* before an access that can hang or abort: the line reaches the partition first */
++static void
++step(const char *what)
++{
++	vlog("step: %s", what);
++	sweet_log_sync(500);
++}
++
++static vm_offset_t
++gcc_va(uint32_t o)
++{
++	switch (o & ~0xfffu) {
++	case 0x0b000: return g_pll ? g_pll + (o & 0xfff) : 0;
++	case 0x17000: return g_ahb ? g_ahb + (o & 0xfff) : 0;
++	case 0x58000: return g_venus ? g_venus + (o & 0xfff) : 0;
++	case 0x6e000: return g_axi ? g_axi + (o & 0xfff) : 0;
++	case 0x79000: return g_vote ? g_vote + (o & 0xfff) : 0;
++	default: return 0;
++	}
++}
++
++static uint32_t
++gccr(uint32_t o)
++{
++	vm_offset_t v = gcc_va(o);
++	return v ? *(volatile uint32_t *)v : 0xffffffffu;
++}
++
++static void
++gccw(uint32_t o, uint32_t val)
++{
++	vm_offset_t v = gcc_va(o);
++	if (v) {
++		__asm__ volatile ("dsb sy" ::: "memory");
++		*(volatile uint32_t *)v = val;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++}
++
++static bool
++venus_map(void)
++{
++	if (g_pll == 0) {
++		g_pll = ml_io_map((vm_offset_t)(GCC_PA + 0x0b000), 0x1000);
++		g_ahb = ml_io_map((vm_offset_t)(GCC_PA + 0x17000), 0x1000);
++		g_venus = ml_io_map((vm_offset_t)(GCC_PA + 0x58000), 0x1000);
++		g_axi = ml_io_map((vm_offset_t)(GCC_PA + 0x6e000), 0x1000);
++		g_vote = ml_io_map((vm_offset_t)(GCC_PA + 0x79000), 0x1000);
++		v_wrap = ml_io_map((vm_offset_t)(VENUS_PA + 0xb0000), 0x1000);
++	}
++	return g_pll && g_ahb && g_venus && g_axi && g_vote && v_wrap;
++}
++
++/* ---------------------------------------------------------------- GDSC, PLL, RCG, branches */
++
++static bool
++gdsc_set(const char *name, uint32_t reg, bool on)
++{
++	uint32_t v = gccr(reg);
++	vlog("GDSC %s %#llx: before %#x, %s", name, GCC_PA + reg, v, on ? "on" : "off");
++	gccw(reg, on ? (v & ~1u) : (v | 1u));         /* SW_COLLAPSE */
++	for (int i = 0; i < 100; i++) {
++		bool pwr = (gccr(reg) & (1u << 31)) != 0;
++		if (pwr == on) {
++			vlog("GDSC %s: %s (%#x) after %d x 10 us", name, on ? "PWR_ON" : "off", gccr(reg), i);
++			return true;
++		}
++		IODelay(10);
++	}
++	vlog("GDSC %s: not %s after 1 ms (%#x)", name, on ? "on" : "off", gccr(reg));
++	return false;
++}
++
++static bool
++pll_enabled(void)
++{
++	return gccr(GPLL11 + PLL_OPMODE) == PLL_RUN && (gccr(GPLL11 + PLL_MODE) & PLL_OUTCTRL);
++}
++
++static void
++pll_configure(void)
++{
++	if (pll_enabled()) {                           /* clk_trion_pll_configure: one that runs is left alone */
++		vlog("GPLL11 already running (mode %#x): not configured", gccr(GPLL11 + PLL_MODE));
++		return;
++	}
++	gccw(GPLL11 + PLL_L, GPLL11_L);
++	gccw(GPLL11 + PLL_CAL_L, GPLL11_CAL_L);
++	gccw(GPLL11 + PLL_ALPHA, GPLL11_ALPHA);
++	gccw(GPLL11 + PLL_CONFIG_CTL, GPLL11_CONFIG);
++	gccw(GPLL11 + PLL_CONFIG_CTL_U, GPLL11_CONFIG_U);
++	gccw(GPLL11 + PLL_CONFIG_CTL_U1, GPLL11_CONFIG_U1);
++	gccw(GPLL11 + PLL_USER_CTL, GPLL11_USER);
++	gccw(GPLL11 + PLL_USER_CTL_U, GPLL11_USER_U);
++	gccw(GPLL11 + PLL_MODE, gccr(GPLL11 + PLL_MODE) | PLL_UPDATE_BYPASS | PLL_FSM_LEGACY_MODE);
++	gccw(GPLL11 + PLL_MODE, gccr(GPLL11 + PLL_MODE) & ~PLL_OUTCTRL);
++	gccw(GPLL11 + PLL_OPMODE, PLL_STANDBY);
++	gccw(GPLL11 + PLL_MODE, gccr(GPLL11 + PLL_MODE) | PLL_RESET_N);
++	vlog("GPLL11 configured: mode %#x L %#x cal_l %#x alpha %#x config %#x %#x %#x user %#x %#x",
++	    gccr(GPLL11 + PLL_MODE), gccr(GPLL11 + PLL_L), gccr(GPLL11 + PLL_CAL_L), gccr(GPLL11 + PLL_ALPHA),
++	    gccr(GPLL11 + PLL_CONFIG_CTL), gccr(GPLL11 + PLL_CONFIG_CTL_U), gccr(GPLL11 + PLL_CONFIG_CTL_U1),
++	    gccr(GPLL11 + PLL_USER_CTL), gccr(GPLL11 + PLL_USER_CTL_U));
++}
++
++static bool
++pll_enable(void)
++{
++	uint32_t mode = gccr(GPLL11 + PLL_MODE);
++	uint32_t want = (mode & PLL_VOTE_FSM_ENA) ? PLL_ACTIVE_FLAG : PLL_LOCK_DET;
++
++	if (mode & PLL_VOTE_FSM_ENA) {
++		gccw(VOTE_PLL, gccr(VOTE_PLL) | (1u << 11));
++	} else {
++		gccw(GPLL11 + PLL_OPMODE, PLL_RUN);
++	}
++	for (int i = 0; i < 100; i++) {                 /* wait_for_pll: 100 reads 1 us apart */
++		if (gccr(GPLL11 + PLL_MODE) & want) {
++			if (!(mode & PLL_VOTE_FSM_ENA)) {
++				gccw(GPLL11 + PLL_USER_CTL, gccr(GPLL11 + PLL_USER_CTL) | PLL_OUT_MASK);
++				gccw(GPLL11 + PLL_MODE, gccr(GPLL11 + PLL_MODE) | PLL_OUTCTRL);
++			}
++			vlog("GPLL11 %s after %d us: mode %#x", (mode & PLL_VOTE_FSM_ENA) ? "active (voted)" : "locked", i,
++			    gccr(GPLL11 + PLL_MODE));
++			return true;
++		}
++		IODelay(1);
++	}
++	vlog("GPLL11 did not %s in 100 us: mode %#x opmode %#x", (mode & PLL_VOTE_FSM_ENA) ? "become active" : "lock",
++	    gccr(GPLL11 + PLL_MODE), gccr(GPLL11 + PLL_OPMODE));
++	return false;
++}
++
++static void
++pll_disable(void)
++{
++	uint32_t mode = gccr(GPLL11 + PLL_MODE);
++
++	if (mode & PLL_VOTE_FSM_ENA) {
++		gccw(VOTE_PLL, gccr(VOTE_PLL) & ~(1u << 11));
++	} else {
++		gccw(GPLL11 + PLL_MODE, mode & ~PLL_OUTCTRL);
++		gccw(GPLL11 + PLL_USER_CTL, gccr(GPLL11 + PLL_USER_CTL) & ~PLL_OUT_MASK);
++		gccw(GPLL11 + PLL_OPMODE, PLL_STANDBY);
++	}
++	vlog("GPLL11 off: mode %#x opmode %#x", gccr(GPLL11 + PLL_MODE), gccr(GPLL11 + PLL_OPMODE));
++}
++
++static bool
++rcg_set(uint32_t cfg)
++{
++	gccw(RCG_VENUS + 4, cfg);
++	gccw(RCG_VENUS, gccr(RCG_VENUS) | 1);           /* UPDATE */
++	for (int i = 0; i < 100; i++) {
++		if ((gccr(RCG_VENUS) & 1) == 0) {
++			vlog("RCG video_venus: cfg %#x cmd %#x", gccr(RCG_VENUS + 4), gccr(RCG_VENUS));
++			return true;
++		}
++		IODelay(10);
++	}
++	vlog("RCG video_venus: update did not complete (cmd %#x cfg %#x)", gccr(RCG_VENUS), gccr(RCG_VENUS + 4));
++	return false;
++}
++
++static bool
++branch_set(const char *name, uint32_t cbcr, bool on)
++{
++	gccw(cbcr, on ? (gccr(cbcr) | 1) : (gccr(cbcr) & ~1u));
++	for (int i = 0; i < 100; i++) {
++		bool off = (gccr(cbcr) & (1u << 31)) != 0;   /* CLK_OFF */
++		if (off != on) {
++			vlog("branch %s %s (%#x)", name, on ? "on" : "off", gccr(cbcr));
++			return true;
++		}
++		IODelay(10);
++	}
++	vlog("branch %s: not %s after 1 ms (%#x)", name, on ? "on" : "off", gccr(cbcr));
++	return !on;                                     /* a branch that will not stop is reported, not fatal */
++}
++
++static bool
++throttle_set(bool on)
++{
++	gccw(VOTE_BRANCH, on ? (gccr(VOTE_BRANCH) | (1u << 28)) : (gccr(VOTE_BRANCH) & ~(1u << 28)));
++	for (int i = 0; i < 100; i++) {
++		bool off = (gccr(CBCR_THROTTLE) & (1u << 31)) != 0;
++		if (off != on) {
++			vlog("branch video_throttle_core %s (%#x)", on ? "on" : "off", gccr(CBCR_THROTTLE));
++			return true;
++		}
++		IODelay(10);
++	}
++	vlog("branch video_throttle_core: not %s after 1 ms (%#x)", on ? "on" : "off", gccr(CBCR_THROTTLE));
++	return !on;
++}
++
++/* ---------------------------------------------------------------- the operations */
++
++static int
++venus_power_on(void)
++{
++	step("map GCC pages and the wrapper page");
++	if (!venus_map()) {
++		vlog("mappings failed");
++		return -1;
++	}
++	vlog("before: GDSC venus %#x vcodec0 %#x; GPLL11 mode %#x opmode %#x; RCG cmd %#x cfg %#x", gccr(GDSC_VENUS),
++	    gccr(GDSC_VCODEC0), gccr(GPLL11 + PLL_MODE), gccr(GPLL11 + PLL_OPMODE), gccr(RCG_VENUS), gccr(RCG_VENUS + 4));
++
++	step("GDSC venus on");
++	if (!gdsc_set("venus", GDSC_VENUS, true)) {
++		return -2;
++	}
++	step("GPLL11 configure and enable");
++	pll_configure();
++	if (!pll_enable()) {
++		return -3;
++	}
++	step("RCG video_venus to 133.33 MHz");
++	if (!rcg_set(RCG_VENUS_133M)) {
++		return -4;
++	}
++	step("controller clocks: core, iface, bus");
++	if (!branch_set("video_venus_ctl (core)", CBCR_VENUS_CTL, true) ||
++	    !branch_set("video_ahb (iface)", CBCR_VIDEO_AHB, true) ||
++	    !branch_set("venus_ctl_axi (bus)", CBCR_VENUS_CTL_AXI, true)) {
++		return -5;
++	}
++	step("GDSC vcodec0 on");
++	if (!gdsc_set("vcodec0", GDSC_VCODEC0, true)) {
++		return -6;
++	}
++	step("core clocks: core0, core0_bus, throttle");
++	if (!branch_set("video_vcodec0_sys (core0)", CBCR_VCODEC0_SYS, true) ||
++	    !branch_set("vcodec0_axi (core0_bus)", CBCR_VCODEC0_AXI, true) ||
++	    !throttle_set(true)) {
++		return -7;
++	}
++	step("read the wrapper: WRAPPER_HW_VERSION, WRAPPER_CORE_POWER_STATUS");
++	uint32_t ver = *(volatile uint32_t *)(v_wrap + (WRAPPER_HW_VERSION & 0xfff));
++	uint32_t pwr = *(volatile uint32_t *)(v_wrap + (WRAPPER_CORE_POWER_STATUS & 0xfff));
++	vlog("WRAPPER_HW_VERSION %#x, WRAPPER_CORE_POWER_STATUS %#x", ver, pwr);
++	vlog("measured: video_venus_ctl %u kHz, video_vcodec0_sys %u kHz",
++	    sapphire_clk_measure_khz(DBG_VIDEO_VENUS_CTL), sapphire_clk_measure_khz(DBG_VCODEC0_SYS));
++	return (ver != 0 && ver != 0xffffffffu) ? 1 : -8;
++}
++
++static int
++venus_power_off(void)
++{
++	if (!venus_map()) {
++		return -1;
++	}
++	step("power off: core clocks, GDSC vcodec0, controller clocks, GDSC venus, GPLL11");
++	throttle_set(false);
++	branch_set("vcodec0_axi (core0_bus)", CBCR_VCODEC0_AXI, false);
++	branch_set("video_vcodec0_sys (core0)", CBCR_VCODEC0_SYS, false);
++	gdsc_set("vcodec0", GDSC_VCODEC0, false);
++	branch_set("venus_ctl_axi (bus)", CBCR_VENUS_CTL_AXI, false);
++	branch_set("video_ahb (iface)", CBCR_VIDEO_AHB, false);
++	branch_set("video_venus_ctl (core)", CBCR_VENUS_CTL, false);
++	gdsc_set("venus", GDSC_VENUS, false);
++	pll_disable();
++	return 0;
++}
++
++static int
++sysctl_sweet_venus SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = venus_state;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, NULL);
++	if (err != 0 || req->newptr == USER_ADDR_NULL) {
++		return err;
++	}
++	if (venus_lock == NULL) {
++		venus_grp = lck_grp_alloc_init("sweet_venus", LCK_GRP_ATTR_NULL);
++		venus_lock = lck_mtx_alloc_init(venus_grp, LCK_ATTR_NULL);
++	}
++	lck_mtx_lock(venus_lock);
++	venus_log_len = 0;
++	venus_log[0] = 0;
++	if (v == 1) {
++		venus_state = venus_state == 1 ? 1 : venus_power_on();
++	} else if (v == 2) {
++		venus_state = venus_power_off();
++	} else {
++		err = EINVAL;
++	}
++	lck_mtx_unlock(venus_lock);
++	return err;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_venus, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_venus, "I", "video block: 1 power on, 2 power off; reads the state (negative: the failed step)");
++
++static int
++sysctl_sweet_venus_log SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	return SYSCTL_OUT(req, venus_log, strlen(venus_log) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_venus_log, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_venus_log, "A", "video block: the last operation's steps");
