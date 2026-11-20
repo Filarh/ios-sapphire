@@ -1,0 +1,38 @@
+xnu 0423: the WLAN board data of this phone (bdn7lmx.bin), not Qualcomm's generic bdwlan.bin
+
+The WCN3988 answers board_id 0xff and WLFW sent image/bdwlan.bin, Qualcomm's generic board data. The phone's Android
+picks a Redmi Note 13 file instead (cnss-daemon find_match_bdf, by ro.boot.hwversion): bdn7gl.bin, bdn7lmx.bin or
+bdn7neu.bin, all in the modem partition next to the generic one and already in the firmware table (0143); on this unit
+ro.wlan.bdf is bdn7lmx.bin. The generic file differs from it in 3557 of 26328 bytes; the three Xiaomi files differ from
+one another in 32. Measured on 2026-11-19 at one spot, the same access points heard by Android and by iOS: 2.4 GHz
+within a few dB, 5 GHz 14-19 dB weaker under iOS (channels 48 and 149).
+
+With board_id 0xff the board data is now image/<wlan_bdf> (boot-arg, bdn7lmx.bin by default), bdwlan.bin if missing.
+---
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 3a9eea4..03dd865 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -4956,8 +4956,21 @@ w_start_bdf(void)
+ 		return;
+ 	}
+ 	w_bdf_started = true;
++	/*
++	 * sapphire 0423: this WCN3988 answers board_id 0xff, and bdwlan.bin is Qualcomm's generic board data. The phone's
++	 * own Android does not use it: its cnss-daemon picks a Redmi Note 13 file by ro.boot.hwversion (find_match_bdf:
++	 * bdn7gl.bin, bdn7lmx.bin, bdn7neu.bin, 26328 bytes each, in the modem partition's image/), and on this unit
++	 * (hwversion 1.49.0, sku n7l) it sends bdn7lmx.bin (ro.wlan.bdf). The generic file differs from it in 3557 bytes
++	 * (547 runs: antenna and per-band tables); the three Xiaomi files differ from one another in 32 (the region's power
++	 * limits). Measured on 2026-11-19 at one spot, Android and iOS hearing the same access points: 2.4 GHz within a few
++	 * dB, 5 GHz 14-19 dB weaker under iOS with the generic file. boot-arg wlan_bdf=NAME (a file of image/, e.g.
++	 * bdn7gl.bin or bdwlan.bin) chooses another; bdn7lmx.bin by default, bdwlan.bin if it is missing.
++	 */
++	char bdf_arg[32] = "bdn7lmx.bin";
++	(void)PE_parse_boot_argn("wlan_bdf", bdf_arg, sizeof(bdf_arg));
++	bdf_arg[sizeof(bdf_arg) - 1] = 0;
+ 	if (w_board == 0xFF) {
+-		snprintf(name, sizeof(name), "image/bdwlan.bin");
++		snprintf(name, sizeof(name), "image/%s", bdf_arg);
+ 	} else if (w_board < 0x100) {
+ 		snprintf(name, sizeof(name), "image/bdwlan.b%02x", w_board);
+ 	} else {
