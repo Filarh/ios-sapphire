@@ -1,0 +1,565 @@
+xnu 0421: kern.sweet_pace: leeway, idle periods and the A53 cluster for the kernel's polling threads, and their names
+
+The port takes no device interrupt but the GPU's (0419): modem_watch (GLINK/QMI, WLAN copy engines and HTT, IPA),
+adsp_thread (GLINK to the ADSP, audio, FastRPC's polls), fr_thread, the USB controller's ud_dp_thread, the touch
+panel, the keys and en0's net_thread look at their hardware from kernel threads of priority 81 between sleeps of
+1-20 ms. Report 16 (§3.2, §5.3) measures ~3600-4100 wakeups a second of such threads on the A73s, four of them every
+~1.2 ms (IOSleep(1)): a possible preemption of backboardd's render thread each (61-112 a second measured) and a
+migration between A73s (66-105 a second), and heat (17 §4.4: iOS idles ~20 C above Android).
+
+New file bsd/dev/sweet_pace.c. kern.sweet_pace (boot-arg sweet_pace), 0 by default: every loop sleeps as before
+(modem_watch and adsp_thread 1 ms, fr_thread 2 ms, USB 1 ms idle and 125 us busy, touch 10 ms up / 4 ms or 0.5 ms
+down, keys 20 ms, net 2 or 10 ms), with no leeway and no binding. With 1:
+  - each idle sleep carries kern.sweet_pace_leeway_pct (25) % of its period as leeway, at most 2 ms
+    (assert_wait_deadline_with_leeway, TIMEOUT_URGENCY_LEEWAY), so the timers can coalesce; the busy ones (USB with
+    traffic, touch with a finger down) keep none;
+  - modem_watch and adsp_thread sleep kern.sweet_pace_idle_ms (4; 1, 2, 4, 5, 8, 10 or 20, divisors of 1000) once
+    their activity count has not moved for kern.sweet_pace_hold_ms (200), and 1 ms again as soon as it moves.
+    Activity: modem, g_rx_msgs + g_tx_msgs + htt_msgs + htt_msdus + etxq_tail + ipa_tx_sent + the IPA LAN and MRX
+    frames; ADSP, a_rx_msgs + a_tx_msgs + a_writes_done + a_gpr_rx_count. Their millisecond counters (ms, a_ms)
+    count loops as before and add the long sleep's milliseconds, landing on multiples of the period so that
+    "ms % 1000 == 0" (ipa_poll's GSI error check) still comes; below 60000 (the boot's timed steps: logs at 3, 5,
+    20, 30 and 44 s, the audio test at 45 s) they keep 1 ms. topaz_wlan_transmit() and topaz_ipa_tx() wake
+    modem_watch at once (sweet_pace_kick) instead of leaving the frame for its next look;
+  - ud_dp_thread sleeps kern.sweet_pace_usb_idle_us (4000, 1000-20000) instead of 1 ms when no frame moved in the
+    last 10 ms; ud_dp_output still wakes it at once, and a frame from the host waits that long at most;
+  - the threads in kern.sweet_pace_ecore (a bit each; all by default) are soft-bound to the A53 cluster
+    (thread_bind_cluster_type(current_thread(), 'E', soft)), where the render thread never runs. Each thread
+    applies a change to kern.sweet_pace or kern.sweet_pace_ecore itself, before its next sleep (no lock held there).
+Whatever the mode, the threads are named (thread_set_thread_name): bit 0 "sweet modem", 1 "sweet adsp", 2 "sweet
+usb", 3 "sweet touch", 4 "sweet net", 5 "sweet keys", 6 "sweet frpc"; report 16 §5.3 could only tell them by their
+period. kern.sweet_pace_stats: per thread, sleeps, idle sleeps, wakeups by a kick, A53 or any.
+
+Not changed: touch with a finger down (0.5 ms grid of 0313; the IC's line is TLMM GPIO 80, whose summary interrupt
+is SPI 227, not routed), the USB busy loop, the vsync timer (120 Hz, software; the MDP's vsync is in MDSS SPI 186),
+UFS command waits, the 100 ms USB log, the 1 s UFS log.
+
+Expected [not measured]: with kern.sweet_pace=1 and an idle system, wakeups of modem_watch and adsp_thread from ~830
+to ~210 a second each, USB from ~830 to ~210, and none of them on an A73 while the A53s have room. Risks: up to the
+idle period of latency on the first frame received by WLAN, IPA or USB and on the first audio buffer after a quiet
+spell; WLAN, audio and USB work on the A53s. Protocol: dev-notes/investigacion/anexos/16-despertares/02-parches.md.
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 8ac65fd..11eadd7 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -129,6 +129,7 @@ bsd/dev/sweet_inject.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_pdp.c			standard
+ bsd/dev/sweet_qsee_ctl.c		standard
++bsd/dev/sweet_pace.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sapphire_net.c b/bsd/dev/sapphire_net.c
+index 4a4496c..53ceda4 100644
+--- a/bsd/dev/sapphire_net.c
++++ b/bsd/dev/sapphire_net.c
+@@ -19,6 +19,7 @@
+ #include <kern/clock.h>
+ #include <kern/locks.h>
+ #include <kern/thread.h>
++#include <kern/sched_prim.h>                    /* 0421: assert_wait (sweet_pace_assert), thread_block */
+ #include <libkern/libkern.h>
+ #include <mach/mach_types.h>
+ #include <net/bpf.h>
+@@ -273,6 +274,12 @@ sapphire_net_link_state(bool up)
+ 	net_link_event(net_ifp, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF);
+ }
+ 
++/* sapphire 0421: the pace of the polling threads (sweet_pace.c) */
++extern void sweet_pace_start(int who, const char *name);
++extern wait_result_t sweet_pace_assert(int who, void *chan, uint64_t deadline, uint64_t period_abs);
++#define PACE_NET    4
++static int net_pace_chan;
++
+ /* The interface's own thread: for a link that wants to be asked, and for the minute's line in the log. */
+ static void
+ net_thread(__unused void *parameter, __unused wait_result_t result)
+@@ -280,6 +287,7 @@ net_thread(__unused void *parameter, __unused wait_result_t result)
+ 	uint64_t said = 0, total;
+ 	unsigned quiet = 0;
+ 
++	sweet_pace_start(PACE_NET, "sweet net");
+ 	for (unsigned tick = 1;; tick++) {
+ 		quiet = net_link->poll != NULL && net_link->poll() ? 0 : quiet + 1;
+ 		/* about once a minute, if anything has moved since */
+@@ -290,7 +298,11 @@ net_thread(__unused void *parameter, __unused wait_result_t result)
+ 			    net_count.sent, net_count.sent_bytes, net_count.received, net_count.received_bytes,
+ 			    net_count.dropped_out, net_count.dropped_in);
+ 		}
+-		delay_for_interval(quiet < 100 ? 2 : 10, NSEC_PER_MSEC);
++		/* 0421: as delay_for_interval(), with leeway when kern.sweet_pace=1 */
++		uint64_t period;
++		nanoseconds_to_absolutetime((quiet < 100 ? 2 : 10) * NSEC_PER_MSEC, &period);
++		(void)sweet_pace_assert(PACE_NET, &net_pace_chan, mach_absolute_time() + period, period);
++		thread_block(THREAD_CONTINUE_NULL);
+ 	}
+ }
+ 
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 82fa076..334c5b7 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -100,12 +100,18 @@ keys_read_locked(uint16_t apid, uint16_t addr, uint8_t *out)
+ 	return false;
+ }
+ 
++/* sapphire 0421: the pace of the polling threads (sweet_pace.c) */
++extern void sweet_pace_start(int who, const char *name);
++extern wait_result_t sweet_pace_assert(int who, void *chan, uint64_t deadline, uint64_t period_abs);
++#define PACE_KEYS   5
++
+ static void
+ keys_wait(void)
+ {
+-	uint64_t deadline;
++	uint64_t deadline, period;
+ 	clock_interval_to_deadline(20, NSEC_PER_MSEC, &deadline);
+-	(void)assert_wait_deadline(&keys_sleep_chan, THREAD_UNINT, deadline);
++	nanoseconds_to_absolutetime(20 * NSEC_PER_MSEC, &period);
++	(void)sweet_pace_assert(PACE_KEYS, &keys_sleep_chan, deadline, period);      /* 0421: leeway with kern.sweet_pace=1 */
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
+@@ -116,6 +122,7 @@ keys_thread(void *arg, wait_result_t result)
+ 	unsigned errors = 0;
+ 	(void)arg;
+ 	(void)result;
++	sweet_pace_start(PACE_KEYS, "sweet keys");      /* 0421 */
+ 	for (;;) {
+ 		uint8_t pon = 0, gpio = 0;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+diff --git a/bsd/dev/sweet_pace.c b/bsd/dev/sweet_pace.c
+new file mode 100644
+index 0000000..39524fb
+--- /dev/null
++++ b/bsd/dev/sweet_pace.c
+@@ -0,0 +1,269 @@
++/*
++ * sapphire 0421: the pace of the kernel's polling threads.
++ *
++ * The port takes no device interrupt but the GPU's (0419): the modem and WLAN (modem_watch), the ADSP and audio
++ * (adsp_thread), FastRPC, the USB controller, the touch panel, the keys and en0's thread look at their hardware
++ * from kernel threads of priority 81 that sleep 1-20 ms between looks. Report 16 §3.2 and §5.3 measure ~3600-4100
++ * wakeups a second of such threads on the A73s, four of them every ~1.2 ms (IOSleep(1)), each a possible preemption
++ * of backboardd's render thread (61-112 a second) and a migration between A73s (66-105 a second).
++ *
++ * kern.sweet_pace (boot-arg sweet_pace), 0 by default: everything exactly as before. With 1:
++ *   - every sleep of these threads carries kern.sweet_pace_leeway_pct (25) % of its period as leeway (at most
++ *     2 ms; TIMEOUT_URGENCY_LEEWAY), so their timers can fire together and the CPUs leave idle less often;
++ *   - the 1 ms loops (modem_watch, adsp_thread) sleep kern.sweet_pace_idle_ms (4; one of 1, 2, 4, 5, 8, 10, 20:
++ *     divisors of 1000, so the loops' own millisecond counters still meet their "ms % 1000 == 0" marks) once
++ *     nothing has moved for kern.sweet_pace_hold_ms (200), and 1 ms again as soon as something moves. Their
++ *     counters count loops, not time, as they did (IOSleep(1) lasts ~1.2 ms): a long sleep adds its milliseconds.
++ *     Before the counter reaches 60000 (the boot's own timed steps: the audio test at 45 s, the logs at 3, 5, 20,
++ *     30 and 44 s) they keep 1 ms. Sending on WLAN or IPA wakes the modem loop at once (sweet_pace_kick);
++ *   - the USB controller's thread sleeps kern.sweet_pace_usb_idle_us (4000) instead of 1 ms when no frame moved in
++ *     the last 10 ms (sending wakes it, as before; a frame from the host waits that long at most);
++ *   - the threads in kern.sweet_pace_ecore (bit per thread below; all by default) are soft-bound to the A53
++ *     cluster (thread_bind_cluster_type 'E', soft: they may still run on an A73 when the A53s are busy), where the
++ *     render thread never runs (16 §2), so they stop preempting it. Each thread rebinds itself at its next sleep
++ *     after a change.
++ * The threads are named (thread_set_thread_name) whatever the mode, for kdebug and thrsched:
++ *   bit 0 "sweet modem", 1 "sweet adsp", 2 "sweet usb", 3 "sweet touch", 4 "sweet net", 5 "sweet keys",
++ *   6 "sweet frpc".
++ * kern.sweet_pace_stats: per thread, the sleeps, the long (idle) ones, the wakeups by a kick, the binding.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++
++#define SWEET_PACE_N    7
++
++extern void sweet_pace_start(int who, const char *name);
++extern unsigned sweet_pace_step(int who, uint64_t activity, unsigned clock_ms);
++extern void sweet_pace_sleep_ms(int who, unsigned ms, void *chan);
++extern void sweet_pace_kick(int who, void *chan);
++extern uint64_t sweet_pace_leeway(int who, uint64_t period_abs);
++extern wait_result_t sweet_pace_assert(int who, void *chan, uint64_t deadline, uint64_t period_abs);
++extern uint64_t sweet_pace_usb_idle_abs(uint64_t dflt);
++
++static int sweet_pace;
++static int sweet_pace_leeway_pct = 25;
++static int sweet_pace_idle_ms = 4;
++static int sweet_pace_hold_ms = 200;
++static int sweet_pace_usb_idle_us = 4000;
++static int sweet_pace_ecore = (1 << SWEET_PACE_N) - 1;
++static volatile uint32_t sweet_pace_gen = 1;             /* changes with kern.sweet_pace and kern.sweet_pace_ecore */
++static bool sweet_pace_args;
++
++static struct sweet_pacer {
++	const char *name;
++	uint64_t sleeps, idle_sleeps, kicks;
++	uint64_t last_act, act_abs;                 /* the activity count last seen, and when it last moved */
++	uint32_t gen;                               /* the binding applied for this sweet_pace_gen */
++	bool started, ecore, kicked;
++} pacers[SWEET_PACE_N];
++
++static void
++sweet_pace_boot_args(void)
++{
++	if (!sweet_pace_args) {
++		sweet_pace_args = true;
++		(void)PE_parse_boot_argn("sweet_pace", &sweet_pace, sizeof(sweet_pace));
++	}
++}
++
++static struct sweet_pacer *
++pacer(int who)
++{
++	return who >= 0 && who < SWEET_PACE_N ? &pacers[who] : NULL;
++}
++
++/* In the thread, at its start and before each sleep: its name once, its cluster when the settings changed. */
++static void
++sweet_pace_bind(struct sweet_pacer *p, int who)
++{
++	uint32_t gen = __atomic_load_n(&sweet_pace_gen, __ATOMIC_RELAXED);
++	if (p->gen == gen) {
++		return;
++	}
++	p->gen = gen;
++	bool e = sweet_pace != 0 && (sweet_pace_ecore & (1 << who)) != 0;
++	if (e != p->ecore) {
++		p->ecore = e;
++		thread_bind_cluster_type(current_thread(), e ? 'E' : '-', e);   /* soft to E; '-': no binding */
++	}
++}
++
++void
++sweet_pace_start(int who, const char *name)
++{
++	struct sweet_pacer *p = pacer(who);
++
++	sweet_pace_boot_args();
++	if (p == NULL) {
++		return;
++	}
++	p->name = name;
++	p->started = true;
++	p->gen = 0;
++	thread_set_thread_name(current_thread(), name);
++	sweet_pace_bind(p, who);
++}
++
++uint64_t
++sweet_pace_leeway(int who, uint64_t period_abs)
++{
++	uint64_t cap;
++
++	(void)who;
++	if (sweet_pace == 0 || sweet_pace_leeway_pct <= 0) {
++		return 0;
++	}
++	nanoseconds_to_absolutetime(2 * NSEC_PER_MSEC, &cap);
++	uint64_t l = period_abs / 100 * (uint64_t)(sweet_pace_leeway_pct > 100 ? 100 : sweet_pace_leeway_pct);
++	return l > cap ? cap : l;
++}
++
++/* How many milliseconds a 1 ms loop sleeps now, and adds to its counter clock_ms: 1, or the idle period. */
++unsigned
++sweet_pace_step(int who, uint64_t activity, unsigned clock_ms)
++{
++	struct sweet_pacer *p = pacer(who);
++	uint64_t now = mach_absolute_time(), hold;
++
++	if (p == NULL) {
++		return 1;
++	}
++	if (activity != p->last_act || p->kicked) {
++		p->last_act = activity;
++		p->act_abs = now;
++		p->kicked = false;
++	}
++	int idle = sweet_pace_idle_ms;
++	if (idle != 1 && idle != 2 && idle != 4 && idle != 5 && idle != 8 && idle != 10 && idle != 20) {
++		idle = 4;
++	}
++	nanoseconds_to_absolutetime((uint64_t)(sweet_pace_hold_ms < 0 ? 0 : sweet_pace_hold_ms) * NSEC_PER_MSEC, &hold);
++	if (sweet_pace == 0 || idle == 1 || clock_ms < 60000 || now - p->act_abs < hold) {
++		return 1;
++	}
++	return (unsigned)idle - clock_ms % (unsigned)idle;      /* to the next multiple of the period */
++}
++
++/* Assert a wait on chan until deadline, with the leeway of a sleep of period_abs. */
++wait_result_t
++sweet_pace_assert(int who, void *chan, uint64_t deadline, uint64_t period_abs)
++{
++	struct sweet_pacer *p = pacer(who);
++	uint64_t leeway = sweet_pace_leeway(who, period_abs);
++
++	if (p != NULL) {
++		sweet_pace_bind(p, who);
++		p->sleeps++;
++	}
++	if (leeway == 0) {
++		return assert_wait_deadline((event_t)chan, THREAD_UNINT, deadline);
++	}
++	return assert_wait_deadline_with_leeway((event_t)chan, THREAD_UNINT, TIMEOUT_URGENCY_LEEWAY, deadline, leeway);
++}
++
++/* The 1 ms loops' sleep: ms milliseconds on chan (NULL: not to be kicked), with leeway. */
++void
++sweet_pace_sleep_ms(int who, unsigned ms, void *chan)
++{
++	struct sweet_pacer *p = pacer(who);
++	uint64_t period, deadline;
++
++	if (sweet_pace == 0 && chan == NULL) {
++		if (p != NULL) {
++			sweet_pace_bind(p, who);
++			p->sleeps++;
++		}
++		delay_for_interval(ms, NSEC_PER_MSEC);  /* exactly as before (IOSleep) */
++		return;
++	}
++	if (p != NULL && ms > 1) {
++		p->idle_sleeps++;
++	}
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &period);
++	deadline = mach_absolute_time() + period;
++	(void)sweet_pace_assert(who, chan != NULL ? chan : (void *)&pacers[0], deadline, period);
++	if (thread_block(THREAD_CONTINUE_NULL) == THREAD_AWAKENED && p != NULL) {
++		p->kicks++;
++	}
++}
++
++/* Something for the loop to do: wake it now, and count it as activity. */
++void
++sweet_pace_kick(int who, void *chan)
++{
++	struct sweet_pacer *p = pacer(who);
++
++	if (p == NULL || sweet_pace == 0) {
++		return;
++	}
++	p->kicked = true;
++	thread_wakeup((event_t)chan);
++}
++
++/* The USB controller's sleep with no frame moved in the last 10 ms. */
++uint64_t
++sweet_pace_usb_idle_abs(uint64_t dflt)
++{
++	uint64_t abs;
++
++	if (sweet_pace == 0) {
++		return dflt;
++	}
++	int us = sweet_pace_usb_idle_us < 1000 ? 1000 : sweet_pace_usb_idle_us > 20000 ? 20000 : sweet_pace_usb_idle_us;
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &abs);
++	return abs;
++}
++
++static int
++sweet_pace_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg2)
++	int *v = (int *)arg1;
++	int n = *v;
++	int error = sysctl_io_number(req, n, sizeof(n), &n, NULL);
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	*v = n;
++	(void)__atomic_add_fetch(&sweet_pace_gen, 1, __ATOMIC_RELAXED);   /* each thread rebinds itself at its next sleep */
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_pace, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    &sweet_pace, 0, sweet_pace_sysctl, "I", "sapphire 0421: 1 = the polling threads' leeway, idle periods and A53 binding; 0 = as before");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_pace_ecore, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    &sweet_pace_ecore, 0, sweet_pace_sysctl, "I", "sapphire 0421: the polling threads soft-bound to the A53s, a bit each (see kern.sweet_pace_stats)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_pace_leeway_pct, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_pace_leeway_pct, 0,
++    "sapphire 0421: leeway of each sleep, % of its period (at most 2 ms)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_pace_idle_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_pace_idle_ms, 0,
++    "sapphire 0421: period of the 1 ms loops (modem, adsp) with nothing moving: 1, 2, 4, 5, 8, 10 or 20");
++SYSCTL_INT(_kern, OID_AUTO, sweet_pace_hold_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_pace_hold_ms, 0,
++    "sapphire 0421: how long after the last activity the 1 ms loops keep 1 ms");
++SYSCTL_INT(_kern, OID_AUTO, sweet_pace_usb_idle_us, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_pace_usb_idle_us, 0,
++    "sapphire 0421: the USB controller thread's sleep with no traffic (1000-20000 us)");
++
++static int
++sweet_pace_stats_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char out[1024];
++	size_t o = 0;
++
++	o += (size_t)snprintf(out + o, sizeof(out) - o, "pace %d (leeway %d %%, idle %d ms, hold %d ms, usb idle %d us, ecore %#x)\n",
++	    sweet_pace, sweet_pace_leeway_pct, sweet_pace_idle_ms, sweet_pace_hold_ms, sweet_pace_usb_idle_us, sweet_pace_ecore);
++	for (int i = 0; i < SWEET_PACE_N && o < sizeof(out); i++) {
++		struct sweet_pacer *p = &pacers[i];
++		if (!p->started) {
++			continue;
++		}
++		o += (size_t)snprintf(out + o, sizeof(out) - o, "%d %s: sleeps %llu, idle %llu, kicked %llu, %s\n", i, p->name,
++		    p->sleeps, p->idle_sleeps, p->kicks, p->ecore ? "A53" : "any");
++	}
++	return SYSCTL_OUT(req, out, strlen(out) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_pace_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sweet_pace_stats_sysctl, "A", "sapphire 0421: the polling threads");
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index b52e799..1840d56 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -132,6 +132,11 @@ touch_wait_until(uint64_t deadline)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/* sapphire 0421: the pace of the polling threads (sweet_pace.c) */
++extern void sweet_pace_start(int who, const char *name);
++extern wait_result_t sweet_pace_assert(int who, void *chan, uint64_t deadline, uint64_t period_abs);
++#define PACE_TOUCH  3
++
+ static void
+ touch_wait_us(unsigned us)
+ {
+@@ -1052,6 +1057,7 @@ touch_thread(void *arg, wait_result_t result)
+ 	uint64_t period_fast, late_after, last_read = 0;
+ 	nanoseconds_to_absolutetime(500 * NSEC_PER_USEC, &period_fast);
+ 	nanoseconds_to_absolutetime(6 * NSEC_PER_MSEC, &late_after);
++	sweet_pace_start(PACE_TOUCH, "sweet touch");    /* 0421 */
+ 	while (!st.dead) {
+ 		if (st.diag == 2 && ++polls == 3000) {  /* ~30 s at 10 ms */
+ 			panic("SWEET TOUCH stats: frames=%u errs=%u lasterr=%d maxn=%u hid down=%u up=%u last=%d,%d | "
+@@ -1100,7 +1106,9 @@ touch_thread(void *arg, wait_result_t result)
+ 		}
+ 		uint64_t period = st.active ? (fast ? period_fast : period_down) : period_up, now = mach_absolute_time();
+ 		next = (next == 0 || now > next + period) ? now + period : next + period;
+-		touch_wait_until(next);
++		/* 0421: with no finger down, the 10 ms look with leeway when kern.sweet_pace=1 (none with a finger) */
++		(void)sweet_pace_assert(PACE_TOUCH, &touch_sleep_chan, next, st.active ? 0 : period);
++		thread_block(THREAD_CONTINUE_NULL);
+ 	}
+ 	touch_report(0, st.x, st.y);
+ out:
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index ef8b41a..aff8525 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1855,9 +1855,16 @@ ud_dp_bus_reset(void)
+ 	dp.notify_pending = false;
+ }
+ 
++/* sapphire 0421: the pace of the polling threads (sweet_pace.c) */
++extern void sweet_pace_start(int who, const char *name);
++extern wait_result_t sweet_pace_assert(int who, void *chan, uint64_t deadline, uint64_t period_abs);
++extern uint64_t sweet_pace_usb_idle_abs(uint64_t dflt);
++#define PACE_USB    2
++
+ static void
+ ud_dp_thread(void *arg __unused, wait_result_t wr __unused)
+ {
++	sweet_pace_start(PACE_USB, "sweet usb");
+ 	for (;;) {
+ 		uint64_t now0 = mach_absolute_time();
+ 
+@@ -1892,8 +1899,9 @@ ud_dp_thread(void *arg __unused, wait_result_t wr __unused)
+ 				continue;
+ 			}
+ 		}
+-		(void)assert_wait_deadline(&dp.chan, THREAD_UNINT,
+-		    mach_absolute_time() + (busy ? dp.abs_125us : dp.abs_1ms));
++		/* 0421: idle, kern.sweet_pace_usb_idle_us with leeway when kern.sweet_pace=1 (1 ms and none otherwise) */
++		uint64_t idle = sweet_pace_usb_idle_abs(dp.abs_1ms);
++		(void)sweet_pace_assert(PACE_USB, &dp.chan, mach_absolute_time() + (busy ? dp.abs_125us : idle), busy ? 0 : idle);
+ 		if (__atomic_load_n(&dp.kick, __ATOMIC_ACQUIRE)) {
+ 			(void)clear_wait(current_thread(), THREAD_AWAKENED);    /* woken before the assert_wait */
+ 		} else {
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index e67c239..3a9eea4 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -502,6 +502,15 @@ static void svc_summary(void);
+ extern "C" int sweet_qmi_deliver(uint32_t dst_port, uint32_t node, uint32_t port, const uint8_t *data, uint32_t len);
+ extern "C" void sweet_qmi_pump(void (*send)(uint32_t src_port, uint32_t node, uint32_t port, const void *data, uint32_t len, int ctrl));
+ extern "C" void sweet_qmi_dev_init(void);
++/* sapphire 0421: the pace of the polling loops (bsd/dev/sweet_pace.c) */
++extern "C" void sweet_pace_start(int who, const char *name);
++extern "C" unsigned sweet_pace_step(int who, uint64_t activity, unsigned clock_ms);
++extern "C" void sweet_pace_sleep_ms(int who, unsigned ms, void *chan);
++extern "C" void sweet_pace_kick(int who, void *chan);
++#define PACE_MODEM  0
++#define PACE_ADSP   1
++#define PACE_FRPC   6
++static int modem_pace_chan;                     /* what modem_watch sleeps on: a frame to send wakes it */
+ static void qmi_user_send(uint32_t src_port, uint32_t node, uint32_t port, const void *data, uint32_t len, int ctrl);
+ static void wlfw_arrive(uint32_t node, uint32_t port);
+ static void ipa_qmi_arrive(uint32_t node, uint32_t port);
+@@ -7757,6 +7766,8 @@ topaz_wlan_transmit(const uint8_t *frame, size_t length)
+ 	IOSimpleLockUnlock(etxq_lock);
+ 	if (!ok) {
+ 		tx_drop++;
++	} else {
++		sweet_pace_kick(PACE_MODEM, &modem_pace_chan);  /* 0421: modem_watch sends it now, not at its next look */
+ 	}
+ 	return ok;
+ }
+@@ -8482,6 +8493,7 @@ topaz_ipa_tx(const uint8_t *pkt, uint32_t len, uint8_t mux)
+ 	mb();
+ 	ipa_txq_head = h + 1;
+ 	IOSimpleLockUnlock(ipa_txq_lock);
++	sweet_pace_kick(PACE_MODEM, &modem_pace_chan);          /* 0421 */
+ 	return 0;
+ }
+ 
+@@ -9298,6 +9310,7 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ 	}
+ 	ipa_out = smp2p_add_out(out, "ipa", 0);
+ 	bool glink = false;
++	sweet_pace_start(PACE_MODEM, "sweet modem");    /* 0421 */
+ 	for (unsigned ms = 0; seconds == 0 || ms < seconds * 1000; ms++) {
+ 		if (ready && !glink) {
+ 			glink = glink_start(part);
+@@ -9364,7 +9377,11 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ 			}
+ 			ipa_last = v;
+ 		}
+-		IOSleep(1);
++		/* 0421: 1 ms, or kern.sweet_pace_idle_ms once nothing moved on GLINK, WLAN or IPA (kern.sweet_pace=1) */
++		unsigned step = sweet_pace_step(PACE_MODEM, (uint64_t)g_rx_msgs + g_tx_msgs + htt_msgs + htt_msdus + etxq_tail +
++		    ipa_tx_sent + IPA_MRX->frames + IPA_LAN->frames, ms);
++		sweet_pace_sleep_ms(PACE_MODEM, step, &modem_pace_chan);
++		ms += step - 1;
+ 	}
+ 	LOG("watch done: slave-kernel %08x, %s", sk_last, ready ? "READY" : "NOT ready");
+ 	if (glink) {
+@@ -14955,9 +14972,10 @@ fr_thread(void *arg __unused, wait_result_t wr __unused)
+ 		}
+ 	}
+ 	fr_logf("serving reverse calls (apps_std from the RAM file store)");
++	sweet_pace_start(PACE_FRPC, "sweet frpc");      /* 0421 */
+ 	for (unsigned t = 0; fr_state == 2; t++) {
+ 		fr_service();
+-		IOSleep(2);
++		sweet_pace_sleep_ms(PACE_FRPC, 2, NULL);    /* 0421: IOSleep(2), with leeway when kern.sweet_pace=1 */
+ 		if (t == 30000) {
+ 			fr_diag("60 s");
+ 		}
+@@ -15048,6 +15066,7 @@ adsp_thread(void *arg __unused, wait_result_t wr __unused)
+ 		adsp_kick(ADSP_SMP2P_BIT);
+ 	}
+ 	LOG("adsp: SMP2P out item %u %p", ADSP_ITEM_SMP2P_OUT, out);
++	sweet_pace_start(PACE_ADSP, "sweet adsp");      /* 0421 */
+ 	for (a_ms = 0;; a_ms++) {
+ 		if (in == NULL && (a_ms % 10) == 0) {
+ 			in = (struct smp2p_hdr *)smem_get(part, ADSP_ITEM_SMP2P_IN, NULL);
+@@ -15137,7 +15156,10 @@ adsp_thread(void *arg __unused, wait_result_t wr __unused)
+ 			    a_up(&a_ch[1]) ? "up" : "down", a_node, a_srv_count, a_gpr_rx_count, a_spf_ready ? "READY" : "not ready",
+ 			    spf_asks);
+ 		}
+-		IOSleep(1);
++		/* 0421: 1 ms, or kern.sweet_pace_idle_ms once nothing moved between the ADSP and us (kern.sweet_pace=1) */
++		unsigned step = sweet_pace_step(PACE_ADSP, (uint64_t)a_rx_msgs + a_tx_msgs + a_writes_done + a_gpr_rx_count, a_ms);
++		sweet_pace_sleep_ms(PACE_ADSP, step, NULL);
++		a_ms += step - 1;
+ 	}
+ 	LOG("adsp: watch stopped at t=%u ms", a_ms);
+ 	thread_terminate(current_thread());

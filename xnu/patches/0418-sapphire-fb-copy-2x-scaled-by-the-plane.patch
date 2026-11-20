@@ -1,0 +1,241 @@
+xnu 0418: kern.sweet_fb_copy2x: a 2x frame that is copied goes 1:1 into a flip buffer and the plane scales it
+
+A frame of the window server that cannot be scanned out (a surface outside the pool, one swapped again while on the
+panel, the ring held to the copy by 0354) is copied by the GPU's 2D engine into a flip buffer of the panel's size:
+two bilinear half passes from 720 x 1600 to 1080 x 2400, 10.4 MB written and ~4.15 ms of GPU a frame (lab log M11),
+and the plane shows the flip buffer unscaled. A frame scanned out leaves the plane scaled over the surface: between the
+two ways the plane's 27 registers change, and the picture is filtered by different hardware.
+
+With kern.sweet_fb_copy2x=1 (boot-arg sweetfb_copy2x=1; 0 by default) presentQueued() asks present() for the
+scanout's own window of the 2x picture (sweet_scan_window(): 720 x 1600 from 16,12 on this phone) copied 1:1 into the
+back flip buffer with rows of 2880 bytes (45 x 64: one pass, the source rectangle as large as the destination). The
+queued frame carries that geometry (0, 0, 720, 1600) and its pitch, and frameShow() flips it with planeScaled(), as a
+frame of a surface: VIG0's QSEED3lite scales it onto the panel. With a linear surface the plane's geometry is the same
+in the two ways (presentScanout() crops the window by the address) and only SRC0_ADDR and the row pitch change; after
+a UBWC frame, planeScaled() with no queued frame gives the plane its linear registers back (0410) and SRC_XY changes.
+A UBWC source is decompressed by 0415's blit, 1:1.
+
+The flip buffers are the same three (a 2x window fits in one, 4.6 of 10.4 MB); the console, the boot frame and display
+off still flip them unscaled through scanFrom(), which sets the plane back (planeUnscaled()). The 1:1 copy is not
+asked for where the plane cannot scale: no 2x drawing, sweet_fb_scan_ready not set by start(), or a flush of the
+scaled plane not taken (fScanStuck). A window that does not fit is copied x1.5 as before. The queue waits for a
+writable plane before such a flip, as for a frame of a surface.
+
+kern.sweet_fb_scanout_diag: "0418: 1:1 copies scaled by the plane (kern.sweet_fb_copy2x N): made, flipped, window not
+fit". Expected [estimate, 03-diseno-pool-y-copia.md B1]: 1.5-2 ms of GPU a copied frame instead of 4.15; not measured
+yet (kern.sweet_gpu_marks=1, protocol in 18-presentacion-y-dpu/04-parches-0417-0418.md).
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2e54c40..dec1b7f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -507,6 +507,19 @@ sweet_fbl_sample(volatile uint32_t *ctl, volatile uint32_t *intf)
+ #define SWEET_FB_SCAN_SLOT      0x00500000u
+ #define SWEET_FB_FMT_BGRA       0x42475241
+ static int sweet_fb_scanout = 1;                /* 0405: on by default (boot-arg sweetfb_scanout=0 turns it off) */
++/*
++ * sapphire 0418: kern.sweet_fb_copy2x (boot-arg sweetfb_copy2x; 0 by default). 1: a frame that goes the copy's way at 2x
++ * is copied 1:1 -- the panel's window of the 2x picture, as the scanout takes it (sweet_scan_window()) -- into a flip
++ * buffer with rows of that width, and the plane scales it onto the panel as it scales a surface (planeScaled()), instead
++ * of the GPU scaling it x1.5 into a flip buffer of the panel's size that the plane shows unscaled. The copy writes 4.6 MB
++ * instead of 10.4 (03-diseno-pool-y-copia.md, B1), and a frame copied between frames scanned out leaves the plane with
++ * the same geometry and scaler: with a linear surface only the address and the row pitch change. The flip buffers are
++ * the same three (a 2x window fits in one); the console, the boot frame and display off still flip them unscaled.
++ */
++static int sweet_fb_copy2x = 0;
++static struct {
++	uint64_t copies, flips, unfit;          /* 1:1 copies made; their flips; frames the window did not fit (copied x1.5) */
++} sweet_fbc;
+ static int sweet_fb_ubwc = 1;                    /* 0405: on by default with direct scanout and a GPU UBWC mode (sweetfb_ubwc=0: off) */
+ static uint64_t sweet_fb_ubwc_flips, sweet_fb_ubwc_errors;
+ static uint64_t sweet_fb_ubwc_copies;             /* 0415: frames of a UBWC surface copied (decompressed) into a flip buffer */
+@@ -841,8 +854,14 @@ public:
+ 		struct SweetGeo geo;
+ 		uint32_t      swap;           /* 0353: the id of the swap it shows (0: none, the timer's or an adopted copy) */
+ 		uint32_t      ox, oy;         /* 0354: a frame of a surface: the window's origin, in pa already */
++		bool          scaled2x;       /* 0418: a 1:1 copy of the 2x window in the flip buffer pa (rows of stride bytes),
++		                               * scaled by the plane with geo, as a frame of a surface */
+ 	};
+ 	struct SweetQFrame fQ[SWEET_FB_BUFS];     /* the frames waiting for the panel, oldest first */
++	/* 0418: presentQueued() asks present() for a 1:1 copy (fCopy2xWant); present() says it made one, and how */
++	bool          fCopy2xWant, fCopy2xDone;
++	struct SweetGeo fCopy2xGeo;     /* the part of the flip buffer the plane scales onto the panel (0, 0, window) */
++	uint32_t      fCopy2xStride, fCopy2xOX, fCopy2xOY;    /* its rows; the window's origin in the surface (diag) */
+ 	uint32_t      fQCount;
+ 	uint64_t      fQRetirePa[2];  /* the flip buffers the MDP may still be reading until it takes the last flip (0: none) */
+ 	bool          fQLatchWait;    /* the last flip written has not been seen taken yet */
+@@ -1101,6 +1120,7 @@ AppleCLCD::start(IOService *provider)
+ 	fPresentLock = IOLockAlloc();
+ 	fGoneShow = NULL;
+ 	fGoneCall = thread_call_allocate(&AppleCLCD::goneWork, this);  /* 0417 */
++	fCopy2xWant = fCopy2xDone = false;                              /* 0418 */
+ 	{
+ 		uint32_t now = 1;
+ 		PE_parse_boot_argn("sweetfb_now", &now, sizeof(now));
+@@ -1310,6 +1330,7 @@ AppleCLCD::scanoutInit(void)
+ 	PE_parse_boot_argn("sweetfb_ubwc", &sweet_fb_ubwc, sizeof(sweet_fb_ubwc));
+ 	PE_parse_boot_argn("sweetfb_flush_taken", &sweet_fb_flush_taken, sizeof(sweet_fb_flush_taken));     /* 0352 */
+ 	PE_parse_boot_argn("sweetfb_swapwait", &sweet_fb_swapwait, sizeof(sweet_fb_swapwait));             /* 0353 */
++	PE_parse_boot_argn("sweetfb_copy2x", &sweet_fb_copy2x, sizeof(sweet_fb_copy2x));                   /* 0418 */
+ 	if (sweet_fb_ubwc != 0 && (sweet_fb_ubwc != 1 || sweet_fb_scanout != 1 || sapphire_gpu_ubwc_mode() == 0)) {
+ 		sweet_fb_ubwc = 0;
+ 		fScanWhy = "UBWC requires sweetfb_scanout=1 and kern.sweet_gpu_ubwc=1";
+@@ -2773,6 +2794,31 @@ AppleCLCD::present(const uint8_t *rec)
+ 				uint32_t csy = (uint32_t)((uint64_t)fOffY * ky / SWEET_FB_LOGICAL_H);
+ 				uint32_t csw = (uint32_t)((uint64_t)fWidth * kx / SWEET_FB_LOGICAL_W);
+ 				uint32_t csh = (uint32_t)((uint64_t)fHeight * ky / SWEET_FB_LOGICAL_H);
++				/*
++				 * 0418: asked for by presentQueued() (kern.sweet_fb_copy2x): the scanout's window, in whole pixels of the 2x
++				 * picture, copied 1:1 into the flip buffer with rows of whole 64 bytes (720 x 4 = 2880 at 2x). The blitter's
++				 * source rectangle is then as large as its destination: one pass, no filtering between rows. A window that
++				 * does not fit the surface or the flip buffer is copied x1.5 as before.
++				 */
++				bool two = false;
++				struct SweetGeo g2 = {};
++				uint32_t p2 = 0;
++				if (fCopy2xWant) {
++					sweet_scan_window(fLogicalW, fLogicalH, fOffX, fOffY, fWidth, fHeight, sweet_fb_rscale, &g2.sx, &g2.sy,
++					    &g2.sw, &g2.sh);
++					p2 = (g2.sw * 4 + 63) & ~63u;
++					two = g2.sw != 0 && g2.sh != 0 && g2.sw <= fWidth && g2.sh <= fHeight && g2.sx + g2.sw <= s->width &&
++					    g2.sy + g2.sh <= s->height && p2 <= 0xffff && (uint64_t)p2 * g2.sh <= (uint64_t)fRowBytes * fHeight;
++					if (two) {
++						csx = g2.sx << 8;
++						csy = g2.sy << 8;
++						csw = g2.sw << 8;
++						csh = g2.sh << 8;
++					} else {
++						sweet_fbc.unfit++;
++					}
++				}
++				const uint32_t cdw = two ? g2.sw : fWidth, cdh = two ? g2.sh : fHeight, cdp = two ? p2 : fRowBytes;
+ 				if (s->ubwc) {
+ 					/*
+ 					 * 0415: a surface in the kernel's UBWC layout (a '&BGA' framebuffer of the pool) is decompressed by the
+@@ -2781,12 +2827,24 @@ AppleCLCD::present(const uint8_t *rec)
+ 					 * off), of a surface swapped again while on the panel, or after the scanout is turned off.
+ 					 */
+ 					shown = sapphire_gpu_copy_scaled_ubwc(s->memory, s->ubwcDataOffset, s->ubwcDataStride, s->ubwcMetaOffset,
+-					    s->ubwcMetaStride, s->width, s->height, csx, csy, csw, csh, dbase, fRowBytes, fWidth, fHeight, dbase,
+-					    (uint64_t)fRowBytes * fHeight);
++					    s->ubwcMetaStride, s->width, s->height, csx, csy, csw, csh, dbase, cdp, cdw, cdh, dbase,
++					    (uint64_t)cdp * cdh);
+ 					sweet_fb_ubwc_copies += shown;
+ 				} else {
+ 					shown = sapphire_gpu_copy_scaled(s->memory, s->offset, s->bytesPerRow, csx, csy, csw, csh,
+-					    dbase, fRowBytes, fWidth, fHeight, dbase, (uint64_t)fRowBytes * fHeight);
++					    dbase, cdp, cdw, cdh, dbase, (uint64_t)cdp * cdh);
++				}
++				if (shown && two) {
++					/* 0418: what the frame queue flips it with (presentQueued()) */
++					fCopy2xDone = true;
++					fCopy2xGeo.sx = 0;
++					fCopy2xGeo.sy = 0;
++					fCopy2xGeo.sw = g2.sw;
++					fCopy2xGeo.sh = g2.sh;
++					fCopy2xStride = p2;
++					fCopy2xOX = g2.sx;
++					fCopy2xOY = g2.sy;
++					sweet_fbc.copies++;
+ 				}
+ 				if (shown) {
+ 					if (fFlip[0] != NULL && sweet_fb_flipflush) {
+@@ -3041,7 +3099,7 @@ AppleCLCD::queueFlip(void)
+ 		queueDrop();
+ 	} else if (fQCount != 0 && taken && frameDone(&fQ[0], now)) {
+ 		/* 0350: a flip that rewrites the plane (to a surface, or back from one) only where it cannot be latched half written */
+-		if ((fQ[0].scan || fPlaneScaled) && !fScanStuck && !planeWritable()) {
++		if ((fQ[0].scan || fQ[0].scaled2x || fPlaneScaled) && !fScanStuck && !planeWritable()) {
+ 			sweet_fbs.window_waits++;
+ 		} else {
+ 			struct SweetQFrame f = fQ[0];
+@@ -3188,7 +3246,11 @@ AppleCLCD::presentQueued(const uint8_t *rec, SweetSurface **held, bool *queued)
+ 	uint64_t pa = fFlipPhys[back];
+ 
+ 	fSwapShow = get32(rec, 0x50);           /* 0353: (a frame the CPU writes is flipped in present()) */
++	/* 0418: a 2x frame copied 1:1, for the plane to scale; not where the plane cannot scale (0350's checks, a flush stuck) */
++	fCopy2xWant = sweet_fb_copy2x != 0 && fScale2 && sweet_fb_scan_ready && !fScanStuck && fCtl0 != NULL && fIntf1 != NULL;
++	fCopy2xDone = false;
+ 	bool copied = present(rec);
++	fCopy2xWant = false;
+ 	fSwapShow = 0;
+ 
+ 	if (fFlipWait) {
+@@ -3203,6 +3265,13 @@ AppleCLCD::presentQueued(const uint8_t *rec, SweetSurface **held, bool *queued)
+ 			f->arrived = fQArrived;
+ 			f->swap = get32(rec, 0x50);     /* 0353 */
+ 			memcpy(f->held, held, sizeof(f->held));
++			if (fCopy2xDone) {
++				f->scaled2x = true;             /* 0418: flipped by planeScaled(), as a frame of a surface */
++				f->geo = fCopy2xGeo;
++				f->stride = fCopy2xStride;
++				f->ox = fCopy2xOX;
++				f->oy = fCopy2xOY;
++			}
+ 			*queued = true;
+ 			sweet_fbq.frames++;
+ 			if (fQCount > sweet_fbq.depth_max) {
+@@ -3210,6 +3279,7 @@ AppleCLCD::presentQueued(const uint8_t *rec, SweetSurface **held, bool *queued)
+ 			}
+ 		}
+ 		sweet_fbd.pend_swap = 0;
++		fCopy2xDone = false;
+ 		queueFlip();                            /* (a copy with nothing ahead of it may be done already) */
+ 		IOLockWakeup(fPresentLock, &fQThread, true);
+ 	} else if (fScanPhys == pa) {
+@@ -3588,6 +3658,15 @@ AppleCLCD::frameShow(struct SweetQFrame *f)
+ 		fScanShowSwap = f->swap;        /* 0353 */
+ 		bzero(f->held, sizeof(f->held));
+ 		sweet_fbs.flips++;
++	} else if (f->scaled2x) {
++		/*
++		 * 0418: a 1:1 copy of the 2x window: the plane scales it as it scales a surface (linear: q NULL gives the plane its
++		 * linear registers back after a UBWC frame). Flip buffer bookkeeping as scanFrom()'s: flipNote() in planeScaled().
++		 */
++		planeScaled(f->pa, f->stride, &f->geo, NULL);
++		fPlaneOX = f->ox;
++		fPlaneOY = f->oy;
++		sweet_fbc.flips++;
+ 	} else {
+ 		scanFrom(f->pa, fRowBytes);
+ 	}
+@@ -4796,6 +4875,30 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_scanout, CTLTYPE_INT | CTLFLAG_RW | CTLFLA
+     NULL, 0, sweet_fb_scanout_sysctl, "I",
+     "sapphire 0350: 1 = the window server's surfaces scanned out by VIG0's scaler (no copy), 2 = their pool only, 0 = as before");
+ 
++/* sapphire 0418: kern.sweet_fb_copy2x (see sweet_fb_copy2x at the top); takes effect at the next frame copied */
++static int
++sweet_fb_copy2x_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = sweet_fb_copy2x;
++	int error = sysctl_handle_int(oidp, &v, 0, req);
++
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (v != 0 && v != 1) {
++		return EINVAL;
++	}
++	if (v == 1 && !sweet_fb_scan_ready) {
++		return EINVAL;                  /* (the plane was not found as the scaler needs it: kern.sweet_fb_scanout_diag) */
++	}
++	sweet_fb_copy2x = v;
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_copy2x, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sweet_fb_copy2x_sysctl, "I",
++    "sapphire 0418: 1 = a 2x frame that is copied goes 1:1 into a flip buffer and VIG0's scaler scales it, as a surface; 0 = x1.5 by the GPU (default)");
++
+ static int
+ sweet_fb_scanout_diag_sysctl SYSCTL_HANDLER_ARGS
+ {
+@@ -4835,6 +4938,8 @@ sweet_fb_scanout_diag_sysctl SYSCTL_HANDLER_ARGS
+ 		    "framebuffer: looks %llu, swaps kept while off let go %llu, frames on the panel shown again by the copy %llu\n",
+ 		    gl[0], gl[1], gl[4], gl[2], gl[3], gl[5], reclaimed, refused_after, sweet_fbg.looks, sweet_fbg.pend, sweet_fbg.shown);
+ 	}
++	SWEET_FBD_CAT("0418: 1:1 copies scaled by the plane (kern.sweet_fb_copy2x %d): made %llu, flipped %llu, window not fit %llu\n",
++	    sweet_fb_copy2x, sweet_fbc.copies, sweet_fbc.flips, sweet_fbc.unfit);
+ 	if (fb != NULL) {
+ 		uint32_t nb = 0;
+ 		for (uint32_t i = 0; i < 8; i++) {
