@@ -1,0 +1,150 @@
+xnu 0423: the WLAN board data of this unit, chosen by its hwversion as the phone's Android does
+
+The WCN3988 answers board_id 0xff and WLFW sent image/bdwlan.bin, Qualcomm's generic board data. The phone's Android
+picks a Redmi Note 13 file instead: /vendor/bin/cnss-daemon (find_match_bdf) compares ro.boot.hwversion with three
+lists (1.2x -> bdn7gl.bin "Global", 1.4x -> bdn7lmx.bin "MX", 2.3x -> bdn7neu.bin "EU"; anything else keeps
+bdwlan.bin). Measured on 2026-11-19 at one spot with the generic file: 2.4 GHz within a few dB of Android, 5 GHz
+14-19 dB weaker (channels 48 and 149).
+
+The unit's hwversion, sku and hwc come from the ABL's bootconfig through the boot shim, which puts them into /chosen
+of the device tree (sapphire,hwversion, sapphire,sku, sapphire,hwc, sapphire,board-source), as iBoot puts a unit's
+syscfg into the ADT. With board_id 0xff the board data is, from specific to generic: boot-arg wlan_bdf=NAME (to
+force a file of image/), the file of cnss-daemon's rule for the hwversion (a declarative table here), bdwlan.bin.
+Without a known hwversion (old shim, no bootconfig) it stays bdwlan.bin. The log says which file, the hwversion,
+the rule and where the hwversion came from.
+---
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 3a9eea4..fc61f7c 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -4947,26 +4947,111 @@ w_bdf_segment(void)
+ 	w_step = "bdf download";
+ }
+ 
+-/* bdwlan.bNN for board ids < 0x100, bdwlan.NNN otherwise, bdwlan.bin as fallback */
++/*
++ * sapphire 0423: which board data (BDF) this unit's WCN3988 gets, the way Apple picks a Wi-Fi chip's calibration:
++ * a fact of the unit, given by the boot loader, looked up in a table, from the most specific file to the most generic.
++ *
++ * The WCN3988 answers board_id 0xff (no board in its OTP) and image/bdwlan.bin is Qualcomm's generic board data. The
++ * phone's Android does not use it: /vendor/bin/cnss-daemon (find_match_bdf) picks a Redmi Note 13 file by
++ * ro.boot.hwversion, comparing strncmp(hwversion, entry, strlen(hwversion)) against three lists; a hwversion in none
++ * of them keeps bdwlan.bin. Measured on 2026-11-19 at one spot with the generic file: 2.4 GHz within a few dB of
++ * Android, 5 GHz 14-19 dB weaker (channels 48 and 149).
++ *
++ * The unit's hwversion is androidboot.hwversion of the ABL's bootconfig; the boot shim (shim/bootcfg.c) copies it,
++ * with androidboot.product.hardware.sku and androidboot.hwc, into /chosen of the device tree as sapphire,hwversion,
++ * sapphire,sku and sapphire,hwc, and says where it found them in sapphire,board-source (as iBoot puts a unit's
++ * syscfg into the ADT). Search order with board_id 0xff: boot-arg wlan_bdf=NAME (a file of image/, to force one),
++ * the file of the rule the hwversion matches, image/bdwlan.bin. An empty hwversion matches nothing here (in
++ * cnss-daemon strlen 0 would match the first list).
++ */
++static const struct {
++	const char *rule;                          /* cnss-daemon's own word for it */
++	const char *file;
++	const char *hwversion[6];
++} w_bdf_rules[] = {
++	{ "Global", "image/bdn7gl.bin", { "1.20.0", "1.20.1", "1.21.0", "1.21.1", "1.22.0", "1.29.0" } },
++	{ "MX", "image/bdn7lmx.bin", { "1.40.0", "1.40.1", "1.41.0", "1.41.1", "1.42.0", "1.49.0" } },
++	{ "EU", "image/bdn7neu.bin", { "2.30.0", "2.30.1", "2.31.0", "2.31.1", "2.32.0", "2.39.0" } },
++};
++
++static bool
++w_chosen_str(const char *prop, char *out, size_t size)
++{
++	DTEntry chosen;
++	const void *v;
++	unsigned n;
++
++	out[0] = 0;
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, prop, &v, &n) != kSuccess || n == 0) {
++		return false;
++	}
++	n = MIN(n, (unsigned)size - 1);
++	memcpy(out, v, n);
++	out[n] = 0;
++	return out[0] != 0;
++}
++
+ static void
+ w_start_bdf(void)
+ {
+-	char name[40];
++	char name[40], forced[32], hwversion[16], sku[16], hwc[16], source[24];
++	const char *why = "generic";
+ 	if (w_bdf_started || !w_msa_ind || !w_cap_done) {
+ 		return;
+ 	}
+ 	w_bdf_started = true;
+-	if (w_board == 0xFF) {
+-		snprintf(name, sizeof(name), "image/bdwlan.bin");
+-	} else if (w_board < 0x100) {
+-		snprintf(name, sizeof(name), "image/bdwlan.b%02x", w_board);
+-	} else {
+-		snprintf(name, sizeof(name), "image/bdwlan.%03x", w_board);
++	bool have = w_chosen_str("sapphire,hwversion", hwversion, sizeof(hwversion));
++	(void)w_chosen_str("sapphire,sku", sku, sizeof(sku));
++	(void)w_chosen_str("sapphire,hwc", hwc, sizeof(hwc));
++	if (!w_chosen_str("sapphire,board-source", source, sizeof(source))) {
++		snprintf(source, sizeof(source), "%s", "no shim note");
++	}
++	LOG("wlfw: unit hwversion '%s' sku '%s' hwc '%s' (from %s)", hwversion, sku, hwc, source);
++	w_bdf_fi = -1;
++	name[0] = 0;
++	if (PE_parse_boot_arg_str("wlan_bdf", forced, sizeof(forced)) && forced[0] != 0) {
++		snprintf(name, sizeof(name), "image/%s", forced);
++		why = "boot-arg wlan_bdf";
++		w_bdf_fi = fw_all_find(name);
++		if (w_bdf_fi < 0) {
++			LOG("wlfw: %s (boot-arg wlan_bdf) missing", name);
++		}
++	}
++	if (w_bdf_fi < 0 && w_board == 0xFF && have) {
++		size_t hl = strlen(hwversion);
++		for (unsigned r = 0; r < sizeof(w_bdf_rules) / sizeof(w_bdf_rules[0]) && w_bdf_fi < 0; r++) {
++			for (unsigned i = 0; i < 6 && w_bdf_rules[r].hwversion[i] != NULL; i++) {
++				if (strncmp(hwversion, w_bdf_rules[r].hwversion[i], hl) == 0) {
++					snprintf(name, sizeof(name), "%s", w_bdf_rules[r].file);
++					why = w_bdf_rules[r].rule;
++					w_bdf_fi = fw_all_find(name);
++					if (w_bdf_fi < 0) {
++						LOG("wlfw: %s (rule %s) missing", name, why);
++					}
++					break;
++				}
++			}
++		}
++		if (w_bdf_fi < 0 && name[0] == 0) {
++			LOG("wlfw: hwversion '%s' is in no rule of cnss-daemon", hwversion);
++		}
++	}
++	if (w_bdf_fi < 0 && w_board != 0xFF) {
++		if (w_board < 0x100) {
++			snprintf(name, sizeof(name), "image/bdwlan.b%02x", w_board);
++		} else {
++			snprintf(name, sizeof(name), "image/bdwlan.%03x", w_board);
++		}
++		why = "board_id";
++		w_bdf_fi = fw_all_find(name);
++		if (w_bdf_fi < 0) {
++			LOG("wlfw: %s missing, using bdwlan.bin", name);
++		}
+ 	}
+-	w_bdf_fi = fw_all_find(name);
+ 	if (w_bdf_fi < 0) {
+-		LOG("wlfw: %s missing, using bdwlan.bin", name);
+ 		snprintf(name, sizeof(name), "image/bdwlan.bin");
++		why = "generic";
+ 		w_bdf_fi = fw_all_find(name);
+ 	}
+ 	if (w_bdf_fi < 0) {
+@@ -4976,7 +5061,7 @@ w_start_bdf(void)
+ 	w_bdf_len = fw_all[w_bdf_fi].size;
+ 	w_bdf_off = 0;
+ 	w_bdf_seg = 0;
+-	LOG("t=%u ms: wlfw: board data %s, %u bytes", g_ms, name, w_bdf_len);
++	LOG("t=%u ms: wlfw: board data %s, %u bytes (hwversion '%s', rule %s)", g_ms, name, w_bdf_len, hwversion, why);
+ 	w_bdf_segment();
+ }
+ 
