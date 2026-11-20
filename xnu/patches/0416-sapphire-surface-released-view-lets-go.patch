@@ -1,0 +1,47 @@
+xnu 0416: a released IOSurface view keeps its state page, not the surface
+
+trapRelease() keeps the last 256 released views of a client so that their state page stays mapped (backboardd reads a
+surface's seed through another framework client after one is released). The kept view also kept its reference to the
+surface: a "CA Framebuffer" or "CA Asynchronous Page" CoreAnimation had let go stayed alive, and with it its slot of
+the scanout pool, until 256 more views were released or backboardd exited. Measured on 2026-11-19 with 0415's census:
+slots of surfaces "NOT in the table, refs 1, GPU buffers 0" -- the kept view's reference alone -- filled the pool, the
+ring's next framebuffer was made outside it (linear) and every frame went the copy's way; restarting backboardd freed
+seven slots of eight.
+
+The kept view now drops the surface once it has given up its use of it; its own map of the state page holds the page.
+---
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 10bf9da..9f6a86c 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1802,6 +1802,7 @@ IOReturn
+ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, void *)
+ {
+ 	unsigned int index;
++	SweetSurface *gone = NULL;          /* 0416 */
+ 	IOLockLock(fLock);
+ 	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, &index, true);
+ 	if (ref == NULL) {
+@@ -1818,6 +1819,14 @@ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, v
+ 		 */
+ 		OSSafeReleaseNULL(ref->data);
+ 		sweet_surface_put(ref->surface);
++		/*
++		 * 0416: the kept view holds its state page (its own map of it), not the surface. Holding the surface kept a
++		 * window server's released "CA Framebuffer" alive -- and its slot of the scanout pool taken -- until 256 more
++		 * views were released or backboardd exited: the pool filled with surfaces no program had, the ring's next one
++		 * was made outside it, and every frame went the copy's way.
++		 */
++		gone = ref->surface;
++		ref->surface = NULL;
+ 		ref->released = true;
+ 		ref->detached = false;
+ 		if (fZombies != NULL && fZombies->setObject(ref)) {
+@@ -1828,6 +1837,7 @@ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, v
+ 		fRefs->removeObject(index);
+ 	}
+ 	IOLockUnlock(fLock);
++	OSSafeReleaseNULL(gone);            /* 0416: (outside fLock: the last reference frees it, and its pool slot) */
+ 	return ref != NULL ? kIOReturnSuccess : kIOReturnNotFound;
+ }
+ 
