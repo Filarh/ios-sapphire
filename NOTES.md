@@ -1,5 +1,28 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## SAPPHIRE 2026-11-24 (evening): handoff — blur, stutter and compiler work; state of the phone
+
+Full write-up in the lab: `dev-notes/investigacion/28-blur-binario-teoria-y-pruebas.md` (§1-§3e) and
+`anexos/28-blur/` (01 QuartzCore reverse engineering, 02 blur math, 03 blurfreeze, 04 phone harness, 05 objc 0433,
+06 compile without stalls); bitácora M47-M48. Observations vs guesses are tagged there.
+
+Observed today (kernel 0432/0433, Control Center = CC):
+- Apple's blur: inputRadius is σ in points; CC background recipe `modulesBackground` has no backdropScale (full-res
+  capture). backdropScale 0.25 on it: GPU 13.48 -> 12.10 ms/cb, looks the same (SSIM 0.9989). Not shipped yet.
+- The slow CC frames (20-50 ms GPU, 18-30 passes): the biggest pass is the static home screen redrawn under CC every
+  frame (6-10 ms, 50-75 %); background blur ~6 ms; home indicator ~2 ms. `metal_fps`'s "stalls" count idle 100 ms
+  ticks, not stutter.
+- Tried and dropped: shouldRasterize on home/wallpaper (artifacts), blurfreeze modes 1/2 (no gain / loses blur),
+  group=1 (modules have no blur), luma=0 (chain in 2 of 30 frames).
+- The 188.8 ms render-thread wait was the per-process compiler mutex held by background uber-shader specialisation.
+  Prototype `async-compile` (two compilers, priority queue, shared sealed cache) on Filarh/hakios-xnu-kernel,
+  cfc91c30: host tests only, NOT yet on the phone.
+
+Phone state when stopping: 0433 by `fastboot boot` (RAM only), original recipe, blurfreeze installed with mode=0,
+metal.args = `metal_fps=1 metal_all=1 metal_hsr=1 metal_hsrdepth=2`. Next: A/B `async-compile` on the phone, the
+pass-memoization prototype (agent still running at stop time), backdropScale 0.25 in the installer, first side-panel
+open after a cold boot.
+
 ## SAPPHIRE 2026-11-24 (afternoon): 0433, the torn objc method-cache read no longer kills processes
 
 Commit on ci/0431-mezcla. 0433 `sapphire-objc-torn-cache-entry` = the 0391 designed in the lab's report 27 (never
