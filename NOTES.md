@@ -1,5 +1,24 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## SAPPHIRE 2026-11-24 (night): render-pass memoization in HakiosMetal — premise check and prototype (Mac only)
+
+No phone, no ssh, no push. Report (Spanish, [O]/[H]): `<scratchpad>/passmemo/INFORME.md`; driver clone
+`<scratchpad>/passmemo/repo`, local branch `passmemo` = `ubwc-pantalla` (87ebb04e) + commit b61e97d7.
+Observed on the 17 CC-opening traces (`scratchpad/ab/tr-*`, 580 consecutive-frame pairs of the screen pass):
+- The screen pass is `load=load`, clipped by CoreAnimation to the damaged rectangle (first draw: an opaque quad
+  over it; `attachment_clear` writes only the memoryless c1). Surfaces rotate among 3.
+- Identical to the previous frame in 14.7 % of pairs (10.6 % of its GPU time); 12.4 % differ only in the dither
+  noise offset (fs buffer 5 of the `...Xhfn` pipelines); the rest in clip rect/geometry (34 %), draw list (26 %).
+- Simulating the prototype's exact policy: 40 hits in 510 passes, -192 ms of 3560 ms (-5.4 %); a hit saves ~5 ms
+  (5.9 ms pass -> ~0.8 ms copy), at the tail of the animation. Guess: ~2x with dither ignored (not exact).
+Prototype: `metal_passmemo=1|2` (+ `_draws=K`, `_cap=BYTES`); structure hashed at encode, bound bytes and
+volatile texture rows hashed at commit, texture write epochs per GEM buffer; a hit becomes a 2D copy cache->target
+plus NOPs, patched at commit. Host: 300 tests, 0 failed (A635 and A610); core cross-compiled for iOS; plug-in
+syntax-checked with the iPhoneOS SDK. Not built as a bundle, not run on the phone.
+Next: build the bundle (lab recipe, SRC=the clone), A/B `metal_passmemo=0` vs `=2` with the run2.sh harness,
+check `passmemo:` lines and `gpass ... memo=2`, screenshots for correctness (steps in INFORME §5). Note: the traced
+driver has `metal_hsr`, which is in neither ubwc-pantalla nor any local tree found: A/B must be this bundle vs itself.
+
 ## SAPPHIRE 2026-11-24 (evening): handoff — blur, stutter and compiler work; state of the phone
 
 Full write-up in the lab: `dev-notes/investigacion/28-blur-binario-teoria-y-pruebas.md` (§1-§3e) and
