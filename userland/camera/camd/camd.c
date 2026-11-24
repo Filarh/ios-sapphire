@@ -65,8 +65,8 @@
 #define RAW_PATH   "/var/tmp/camd-raw.bin"
 #define IDLE_OFF_S 30
 #define MOBILE_UID 501
-#define PV_FPS     15.0     /* preview frames processed per second at most */
-#define PV_FPS_DEV 4.0      /* ... while a still is being developed */
+#define PV_FPS     30.0     /* preview frames processed per second at most */
+#define PV_FPS_DEV 10.0     /* ... while a still is being developed */
 #define WD_NOFRAME 2.0      /* watchdog: seconds without a frame */
 
 /* ================================================================== memory limit */
@@ -159,7 +159,7 @@ static int mode_rot(int m);
 static int mode_maxout(int m)
 {
 	if (m == 3) return CAMD_SHM_MAXDIM;
-	if (MODES[m].slot == 0) return 1000;
+	if (MODES[m].slot == 0) return 1200;
 	int longest = MODES[m].w > MODES[m].h ? MODES[m].w : MODES[m].h;
 	return longest / 2 < CAMD_SHM_MAXDIM ? longest / 2 : CAMD_SHM_MAXDIM;
 }
@@ -247,7 +247,7 @@ struct client {
 	dispatch_source_t rs;
 	char buf[1024];
 	size_t n;
-	bool gone, wants_preview;
+	bool gone, wants_preview, is_face;
 	int mode;
 	double want_at;
 	struct client *next;
@@ -348,7 +348,7 @@ static struct {
 	double gplain, gmean, E_at_stats;
 	bool have_stats, wb_manual;
 	float wb[3];
-} ae = { .E = 8000, .gain = 1, .mx = -1, .my = -1, .wb = { 1.9f, 1.0f, 1.6f } };
+} ae = { .E = 8000, .gain = 1, .mx = -1, .my = -1, .wb = { 1.48f, 1.0f, 1.77f } };
 
 static int
 mode_rot(int m)
@@ -785,10 +785,14 @@ ae_update(const PvStats *st)
 	ae.have_stats = true;
 	if (!ae.wb_manual && st->n > 200 && st->mean[0] > 1e-4 && st->mean[2] > 1e-4) {
 		double gr = st->mean[1] / st->mean[0], gb = st->mean[1] / st->mean[2];
-		gr = gr < 0.8 ? 0.8 : gr > 3.5 ? 3.5 : gr;
-		gb = gb < 0.8 ? 0.8 : gb > 3.5 ? 3.5 : gb;
-		ae.wb[0] = (float)(0.85 * ae.wb[0] + 0.15 * gr);
-		ae.wb[2] = (float)(0.85 * ae.wb[2] + 0.15 * gb);
+		/* Bound WB gains to daylight / Planckian realistic locus:
+		 * S5KHM6 & OV16A1Q valid gamut: R gain [1.2, 2.8], B gain [1.1, 2.5]
+		 * Prevents sickly green / bluish casts in low light */
+		gr = gr < 1.2 ? 1.2 : gr > 2.8 ? 2.8 : gr;
+		gb = gb < 1.1 ? 1.1 : gb > 2.5 ? 2.5 : gb;
+		/* Heavy exponential smoothing (0.94 / 0.06) to eliminate color fluttering */
+		ae.wb[0] = (float)(0.94 * ae.wb[0] + 0.06 * gr);
+		ae.wb[2] = (float)(0.94 * ae.wb[2] + 0.06 * gb);
 		ae.wb[1] = 1;
 	}
 	if (ae.manual || Eapplied <= 0) return;
@@ -848,6 +852,7 @@ shm_slot(unsigned i)
 
 /* ================================================================== preview (camq) */
 #define RENDER_CHUNKS 4
+
 typedef struct {
 	const uint8_t *raw;
 	PvRaw r;
@@ -879,6 +884,7 @@ render_frame(const uint8_t *raw, int mode, uint64_t ts_ns, PvStats *out)
 	unsigned slot = (shm->latest + 1) % CAMD_SHM_SLOTS;
 	j.dst = shm_slot(slot);
 	j.dst_stride = ((long)ow * 4 + 63) & ~63L;
+	shm->reserved[slot] = 0;
 	j.rows = (j.r.h - B) / S + 1;
 	dispatch_apply(RENDER_CHUNKS, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t k) {
 		int a = (int)((long)j.rows * (long)k / RENDER_CHUNKS), b = (int)((long)j.rows * (long)(k + 1) / RENDER_CHUNKS);
@@ -1642,8 +1648,18 @@ handle_line(struct client *c, char *line)
 			return;
 		}
 		int m = atoi(args);
+		bool face = (strstr(args, "FACE") != NULL);
+		if (!face) {
+			for (struct client *o = clients; o; o = o->next) {
+				if (!o->gone && o->wants_preview && o->is_face) {
+					o->wants_preview = false;
+					reply(o, "PREEMPTED");
+				}
+			}
+		}
 		if (m != 1 && m != 3 && m != 4 && !(m >= 11 && m <= 13 && camk.ring)) m = default_preview_mode();
 		if (m == 3 && !camk.ring) m = 1;
+		c->is_face = face;
 		c->wants_preview = true;
 		c->mode = m;
 		c->want_at = now_s();

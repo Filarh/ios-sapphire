@@ -8,18 +8,25 @@ set -e
 cd "$(dirname "$0")"
 SDK=${SDK:-$HOME/sdks/theos-sdks/iPhoneOS16.5.sdk}
 LDID=${LDID:-$HOME/tools-dl/ldid/ldid}
-CC="/usr/lib/llvm-18/bin/clang -target arm64-apple-ios15.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall"
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    CC_BIN="${CC:-$(xcrun -find clang)}"
+    LDFLAGS=""
+else
+    CC_BIN="${CC:-/usr/lib/llvm-18/bin/clang}"
+    LDFLAGS="-fuse-ld=lld"
+fi
+CC="$CC_BIN -target arm64-apple-ios15.0 -isysroot $SDK $LDFLAGS -O2 -Wall"
 out=${1:-/tmp}
 $CC -framework CoreFoundation -o "$out/fpd" fpd.c
 $CC -o "$out/fpload" fpload.c
 $CC -o "$out/fpsave" fpsave.c
 $CC -o "$out/fpctl" fpctl.c
-for t in SapphireFingerprint SapphireFingerprintSettings; do
+for t in SapphireFingerprint SapphireFingerprintSettings SapphireBiometry; do
 	$CC -fobjc-arc -dynamiclib -install_name /var/jb/usr/lib/TweakInject/$t.dylib \
 		-lobjc -framework Foundation -framework UIKit -framework QuartzCore -framework CoreGraphics -o "$out/$t.dylib" $t.m
 	cp $t.plist "$out/"
 done
-for f in fpd fpload fpsave fpctl SapphireFingerprint.dylib SapphireFingerprintSettings.dylib; do "$LDID" -S "$out/$f"; done
+for f in fpd fpload fpsave fpctl SapphireFingerprint.dylib SapphireFingerprintSettings.dylib SapphireBiometry.dylib; do "$LDID" -S "$out/$f"; done
 cp com.sapphire.fpd.plist "$out/"
 
 # the app

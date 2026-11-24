@@ -12,6 +12,7 @@
 #include "fdt.h"
 #include "loader.h"
 #include "splash.h"
+#include "board.h"
 
 #define BOOT_LINE_LENGTH	608
 #define PAGE_16K		0x4000UL
@@ -105,10 +106,16 @@ typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 /* build.sh appends the payload to the Image at the first 4K boundary after _end */
 extern char _end[];
 
+/* the unit's identity from the ABL, read before anything in the initrd is moved (board.c) */
+static struct board board;
+
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
 	uintptr_t emb = ((uintptr_t)_end + 0xfff) & ~0xfffUL;
+
+	board_from_abl(dtb, &board);
+	con_str("BOARD", board.hwversion[0] ? board.hwversion : board.source);
 
 	/*
 	 * topaz: the ABL only passes the vendor_boot ramdisk for a v4 boot
@@ -196,7 +203,22 @@ const char *loader_boot(uintptr_t dtb)
 	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
 	if (mem_size != p->mem_size && !adt_set_u64(adt_pa, p->adt_size, "dram-size", mem_size))
 		return "no dram-size in ADT";
-	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
+	/*
+	 * As iBoot puts a unit's syscfg into the device tree: /chosen gets sapphire,hwversion, sapphire,sku and
+	 * sapphire,hwc as the ABL gave them, and sapphire,board-source says where they came from or why they are missing
+	 * (xnu 0423 picks the WLAN board data by the hwversion). Nothing here stops the boot.
+	 */
+	uint64_t adt_size = p->adt_size;
+	if (board.hwversion[0]) {
+		adt_chosen_add_str(adt_pa, &adt_size, "sapphire,hwversion", board.hwversion);
+		if (board.sku[0])
+			adt_chosen_add_str(adt_pa, &adt_size, "sapphire,sku", board.sku);
+		if (board.hwc[0])
+			adt_chosen_add_str(adt_pa, &adt_size, "sapphire,hwc", board.hwc);
+	}
+	if (!adt_chosen_add_str(adt_pa, &adt_size, "sapphire,board-source", board.source))
+		con_str("BOARD", "no /chosen in the ADT");
+	uintptr_t ba_pa = (adt_pa + adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
 
 	zero64(ba_pa, PAGE_16K);
@@ -214,7 +236,7 @@ const char *loader_boot(uintptr_t dtb)
 	ba->Video.v_height = FB_H;
 	ba->Video.v_depth = 32;
 	ba->deviceTreeP = adt_pa - pa_of_va_base;	/* xnu reads it with the MMU on: a VA */
-	ba->deviceTreeLength = (uint32_t)p->adt_size;
+	ba->deviceTreeLength = (uint32_t)adt_size;
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
 		ba->CommandLine[i] = p->cmdline[i];
 	if (splash_shown) {
