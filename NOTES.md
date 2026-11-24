@@ -1,5 +1,25 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## SAPPHIRE 2026-11-24 (afternoon): 0433, the torn objc method-cache read no longer kills processes
+
+Commit on ci/0431-mezcla. 0433 `sapphire-objc-torn-cache-entry` = the 0391 designed in the lab's report 27 (never
+integrated; rewritten from 27 §1.3-§1.5 and the binary). On A53/A73 (no FEAT_LSE2) objc_msgSend's `ldp` of a method
+cache bucket can see the selector with imp 0 and branch to the class itself: SIGBUS KERN_PROTECTION_FAILURE, pc = far
+= OBJC_CLASS_$_.... Today it hit SpringBoard at launch (pc = OBJC_CLASS_$_LSApplicationIdentity, FBSApplicationLibrary
+_load) and, with tweaks loaded, sent it to safe mode. 0433, in handle_user_abort: when pc = far = x15 = x16 = x17,
+x9 = x1 != 0, the bucket was really read, the task uses the 20H392 shared cache (UUID 8F970452-C9E3-3E88-B114-
+FEB1864BC9E0) and __objc_msgSend_uncached (0x1800ba7c0 + slide) has its three known instructions, the thread resumes
+there (only pc changes). kern.sweet_objc_tear (default 1), kern.sweet_objc_tear_count, kern.sweet_objc_tear_refused,
+`SWEET OBJC:` lines. Numbered 0433 because 0419/0422 also touch sleh.c.
+
+Kernel built locally (dxb2, TOPAZ_4K=1), 0001-0433 applied, LC_UUID 12DC597C-A27C-32B5-B7D4-9BB479667575; image
+~/sapphire-build/images/boot-0433-objctear.img = boot-0432-mezcla's boot args and shim, `fastboot boot` only.
+Reproducer tools/objctear/objctear.c (spawnfg, mode ui):
+- kernel 0432: CRASHED in round 89, torn-bucket signature YES (esr 0x8200000f).
+- 0433, kern.sweet_objc_tear=0: CRASHED, signature YES.
+- 0433, kern.sweet_objc_tear=1: SURVIVED 120 s, 2254 rounds, 1.73 M calls all correct; count 0 -> 37, refused 0.
+Not yet seen: a SpringBoard launch rescued in real use (count > 0 outside objctear); long-run soak.
+
 ## SAPPHIRE 2026-11-24: 0431-0432, a mix of HouseOfBalance's fork on 0430 (branch ci/0431-mezcla)
 
 Commit 53a9103 on ci/0431-mezcla (from ci/0430-venus-power). Kernel built locally on the build Mac

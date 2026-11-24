@@ -1,0 +1,222 @@
+xnu 0433: a branch to a class after a torn objc method-cache bucket resumes at __objc_msgSend_uncached
+
+Designed as 0391 sapphire-objc-torn-cache-entry (report 27 §1.3-§1.5, §4) and lost before it entered the series;
+renumbered 0433 because it touches osfmk/arm64/sleh.c after 0419 and 0422.
+
+libobjc's cache_t::insert writes a method-cache bucket {imp ^ isa, sel} with one STP and objc_msgSend reads it with
+one LDP. On Apple's cores (FEAT_LSE2) the 16-byte pair is single-copy atomic; on the Cortex-A53/A73 it is not, and
+the phone measures it tearing (pairtear: one torn pair in ~7000 reads A73 -> A73). When the reader sees the new sel
+with imp still 0 the hit path computes 0 ^ isa = the class and branches to it: an EL0 instruction abort with a
+permission fault, KERN_PROTECTION_FAILURE, SIGBUS with pc = far = OBJC_CLASS_$_... (SpringBoard in FBSApplicationLibrary
+_load -> safe mode, seserviced, objctear 8 of 8). The state is always pc = far = x17 = x16 = x15, x9 = x1 = the sel.
+
+In handle_user_abort, after vm_fault refused an EL0 instruction abort with KERN_PROTECTION_FAILURE, if the registers
+are exactly that, the bucket at x13 + 0x10 now holds sel = x1, the task's shared region is the 20H392 cache (UUID
+8F970452-C9E3-3E88-B114-FEB1864BC9E0) and __objc_msgSend_uncached (0x1800ba7c0 + slide) holds "stp fp, lr",
+"mov fp, sp" at +0/+4 and "mov x16, x15" at +0x30, the thread resumes there: the miss path of objc_msgSend and
+objc_msgSendSuper2, which looks the method up under the runtime lock and calls it with x0-x8, q0-q7 and lr as they
+were. Only pc changes. objc_msgLookup is not covered unless its caller keeps x9/x15/x16.
+
+kern.sweet_objc_tear: 1 (default) resume, 0 deliver the fault as before. kern.sweet_objc_tear_count: threads resumed;
+kern.sweet_objc_tear_refused: the register state matched and a check refused. "SWEET OBJC: ..." on the console for
+the first 16 and every 1024th of each.
+
+Checked: addresses, instructions and UUID in the 20H392 dyld shared cache with ipsw; sleh.c and kern_sysctl.c compile
+with the flags of the 0432 build. Not yet built into a kernel nor run on the phone.
+
+diff --git a/bsd/kern/kern_sysctl.c b/bsd/kern/kern_sysctl.c
+index 16a02b0..a61fca9 100644
+--- a/bsd/kern/kern_sysctl.c
++++ b/bsd/kern/kern_sysctl.c
+@@ -2614,6 +2614,34 @@ sysctl_sweet_cpuregs SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_cpuregs,
+     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_cpuregs, "A",
+     "sapphire: cache identification and control registers read on every CPU (architectural registers only)");
++
++/* sapphire 0433: torn libobjc method-cache entries resumed at __objc_msgSend_uncached (osfmk/arm64/sleh.c) */
++extern uint32_t sweet_objc_tear;
++extern uint64_t sweet_objc_tear_count;
++extern uint64_t sweet_objc_tear_refused;
++
++static int
++sysctl_sweet_objc_tear SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int mode = (int)os_atomic_load(&sweet_objc_tear, relaxed), changed = 0;
++	int error = sysctl_io_number(req, mode, sizeof(mode), &mode, &changed);
++	if (error == 0 && changed) {
++		if (mode < 0 || mode > 1) {
++			return EINVAL;
++		}
++		os_atomic_store(&sweet_objc_tear, (uint32_t)mode, relaxed);
++	}
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_objc_tear,
++    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_objc_tear, "I",
++    "sapphire: 1 = a branch to a class after a torn objc method-cache bucket resumes at __objc_msgSend_uncached "
++    "(default), 0 = the fault goes to the process");
++SYSCTL_QUAD(_kern, OID_AUTO, sweet_objc_tear_count, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_objc_tear_count,
++    "sapphire: threads resumed at __objc_msgSend_uncached after a torn objc method-cache bucket");
++SYSCTL_QUAD(_kern, OID_AUTO, sweet_objc_tear_refused, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_objc_tear_refused,
++    "sapphire: faults with the register state of a torn objc bucket that a check refused (delivered as before)");
+ #endif /* __arm64__ && ARM64_BOARD_CONFIG_SWEET */
+ 
+ #if __arm64__
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index d49f405..09099f4 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -952,6 +952,137 @@ sweet_emulate_lse(arm_saved_state_t *state, uint32_t instr)
+ 	add_saved_state_pc(state, 4);
+ 	return true;
+ }
++
++/*
++ * sapphire 0433 (sapphire-objc-torn-cache-entry, designed as 0391): a torn method-cache entry of libobjc.
++ *
++ * libobjc's cache_t::insert writes a bucket {imp ^ isa, sel} with one STP, and objc_msgSend reads it with one
++ * LDP. Apple's cores have FEAT_LSE2 (a 16-byte aligned LDP/STP is single-copy atomic); the Cortex-A53/A73
++ * (ARMv8.0) do not, and the pair tears (measured on the phone: report 27 §1.5). When the reader sees the new sel
++ * with the old imp 0, the hit path (iOS 16.7 20H392, libobjc, shared cache 8F970452-...):
++ *
++ *	0x1800ba410	mov	x15, x16		x16 = x15 = the class
++ *	0x1800ba42c	ldp	x17, x9, [x13], #-0x10	x17 = imp ^ class (here 0), x9 = sel; x13 = bucket - 0x10
++ *	0x1800ba430	cmp	x9, x1
++ *	0x1800ba438	eor	x17, x17, x16		x17 = 0 ^ class = class
++ *	0x1800ba43c	br	x17			-> instruction abort, permission fault (the class is data)
++ *
++ * leaves exactly pc = far = x17 = x16 = x15 = the class, x9 = x1 = the selector (objc_msgSendSuper2 the same,
++ * with x16 = x15 = the superclass and x0 already the receiver). Every crash with pc = OBJC_CLASS_$_... on the
++ * phone has that state (SpringBoard, seserviced, objctear). The thread is resumed at __objc_msgSend_uncached,
++ * where both functions go when a bucket misses: it saves x0-x8 and q0-q7, looks the method up under the runtime
++ * lock (lookUpImpOrForward(x0, x1, x15), which also fills the cache), restores them and tail-calls the imp with
++ * lr untouched; nothing it reads is left over from the torn bucket. The registers are not changed; only pc.
++ *
++ * It is done only if all of this holds, else the fault goes to the process as before:
++ *  - the abort is an EL0 instruction abort that vm_fault refused with KERN_PROTECTION_FAILURE;
++ *  - pc = far = x17 = x16 = x15 (8-byte aligned), x1 != 0, x9 = x1;
++ *  - the bucket the LDP read (x13 + 0x10) can be read and holds sel = x1 now (the STP has completed);
++ *  - the task's shared region is the cache with UUID 8F970452-C9E3-3E88-B114-FEB1864BC9E0, mapped;
++ *  - 0x1800ba7c0 + slide is inside it and holds "stp fp, lr, [sp, #-0x10]!", "mov fp, sp" at +0 and +4 and
++ *    "mov x16, x15" at +0x30.
++ * The pc of the BR itself is not known (it is lost in the branch), so the caller cannot be checked to be in
++ * libobjc; the class itself can be anywhere (shared cache __DATA, a dylib, or the heap for runtime-made classes).
++ * objc_msgLookup/objc_msgLookupSuper2 return x17 to a caller that branches to it: the same state results only if
++ * the caller keeps x9, x15 and x16, and resuming at __objc_msgSend_uncached is then also right, but not checked.
++ *
++ * kern.sweet_objc_tear: 1 (default) resume, 0 deliver the fault as before. kern.sweet_objc_tear_count: threads
++ * resumed; kern.sweet_objc_tear_refused: same register state, a check failed. "SWEET OBJC: ..." on the console for
++ * the first 16 and every 1024th of each.
++ */
++#include <vm/vm_shared_region.h>
++extern char *proc_name_address(void *p);
++
++#define SWEET_OBJC_UNCACHED     0x1800ba7c0ULL          /* __objc_msgSend_uncached, unslid (20H392) */
++#define SWEET_OBJC_INSN_STP_FP  0xa9bf7bfdU             /* +0x00 stp fp, lr, [sp, #-0x10]! */
++#define SWEET_OBJC_INSN_MOV_FP  0x910003fdU             /* +0x04 mov fp, sp */
++#define SWEET_OBJC_INSN_MOV_X16 0xaa0f03f0U             /* +0x30 mov x16, x15 */
++static const uint8_t sweet_objc_dsc_uuid[16] = {        /* 8F970452-C9E3-3E88-B114-FEB1864BC9E0 */
++	0x8f, 0x97, 0x04, 0x52, 0xc9, 0xe3, 0x3e, 0x88, 0xb1, 0x14, 0xfe, 0xb1, 0x86, 0x4b, 0xc9, 0xe0,
++};
++
++uint32_t sweet_objc_tear = 1;
++uint64_t sweet_objc_tear_count;
++uint64_t sweet_objc_tear_refused;
++
++static void
++sweet_objc_tear_log(const char *what, uint64_t n, arm_saved_state_t *state, uint64_t target, uint64_t slide)
++{
++	if (n > 16 && (n % 1024) != 0) {
++		return;
++	}
++	task_t task = current_task();
++	void *proc = get_bsdtask_info(task);
++	printf("SWEET OBJC: %s #%llu %s[%d] class 0x%llx sel 0x%llx lr 0x%llx x13 0x%llx -> 0x%llx (slide 0x%llx)\n",
++	    what, n, proc ? proc_name_address(proc) : "?", task_pid(task),
++	    (uint64_t)get_saved_state_pc(state), (uint64_t)get_saved_state_reg(state, 1),
++	    (uint64_t)get_saved_state_lr(state), (uint64_t)get_saved_state_reg(state, 13), target, slide);
++}
++
++static bool
++sweet_objc_torn_entry(arm_saved_state_t *state, vm_offset_t fault_addr)
++{
++	uint64_t pc = get_saved_state_pc(state);
++	uint64_t sel = get_saved_state_reg(state, 1);
++	uint64_t slide = 0, target = 0, start = 0, end = 0;
++	const char *why = NULL;
++
++	if (!PSR64_IS_USER64(get_saved_state_cpsr(state)) ||
++	    pc != (uint64_t)fault_addr || pc == 0 || (pc & 7) != 0 || sel == 0 ||
++	    get_saved_state_reg(state, 17) != pc || get_saved_state_reg(state, 16) != pc ||
++	    get_saved_state_reg(state, 15) != pc || get_saved_state_reg(state, 9) != sel) {
++		return false;           /* not the state objc_msgSend leaves: an ordinary fault */
++	}
++	if (os_atomic_load(&sweet_objc_tear, relaxed) == 0) {
++		return false;
++	}
++
++	/* The bucket the LDP read: post-indexed by -0x10, so it is at x13 + 0x10. By now the STP has completed. */
++	uint64_t bucket[2];
++	if (copyin((user_addr_t)(get_saved_state_reg(state, 13) + 0x10), bucket, sizeof(bucket)) != 0) {
++		why = "refused (bucket unreadable)";
++	} else if (bucket[1] != sel) {
++		why = "refused (bucket sel differs)";
++	}
++
++	if (why == NULL) {
++		vm_shared_region_t sr = vm_shared_region_get(current_task());
++		if (sr == NULL) {
++			why = "refused (no shared region)";
++		} else {
++			if (!sr->sr_uuid_copied || sr->sr_mapping_in_progress ||
++			    sr->sr_first_mapping == (mach_vm_offset_t)-1 ||
++			    memcmp(sr->sr_uuid, sweet_objc_dsc_uuid, sizeof(sweet_objc_dsc_uuid)) != 0) {
++				why = "refused (other shared cache)";
++			}
++			slide = sr->sr_slide;
++			start = sr->sr_base_address + sr->sr_first_mapping;
++			end = sr->sr_base_address + sr->sr_size;
++			vm_shared_region_deallocate(sr);
++		}
++	}
++	if (why == NULL) {
++		target = SWEET_OBJC_UNCACHED + slide;
++		uint32_t insn[13];
++		if (target < start || target + sizeof(insn) > end) {
++			why = "refused (outside the shared cache)";
++		} else if (copyin((user_addr_t)target, insn, sizeof(insn)) != 0) {
++			why = "refused (__objc_msgSend_uncached unreadable)";
++		} else if (insn[0] != SWEET_OBJC_INSN_STP_FP || insn[1] != SWEET_OBJC_INSN_MOV_FP ||
++		    insn[12] != SWEET_OBJC_INSN_MOV_X16) {
++			why = "refused (__objc_msgSend_uncached differs)";
++		}
++	}
++
++	if (why != NULL) {
++		sweet_objc_tear_log(why, os_atomic_inc(&sweet_objc_tear_refused, relaxed), state, target, slide);
++		return false;
++	}
++	set_saved_state_pc(state, (register_t)target);
++	sweet_objc_tear_log("torn method-cache entry, resumed at __objc_msgSend_uncached",
++	    os_atomic_inc(&sweet_objc_tear_count, relaxed), state, target, slide);
++	return true;
++}
+ #endif /* SWEET */
+ 
+ /*
+@@ -1502,6 +1633,14 @@ handle_user_abort(arm_saved_state_t *state, uint32_t esr, vm_offset_t fault_addr
+ 			panic("vm_fault() KERN_FAILURE from user fault on thread %p", thread);
+ 		}
+ 
++#if defined(SWEET)
++		/* sapphire 0433: objc_msgSend branched to a class after a torn method-cache bucket */
++		if (result == KERN_PROTECTION_FAILURE && ESR_EC(esr) == ESR_EC_IABORT_EL0 &&
++		    sweet_objc_torn_entry(state, fault_addr)) {
++			return;
++		}
++#endif
++
+ 		codes[0] = result;
+ 	} else if (is_alignment_fault(fault_code)) {
+ 		kern_return_t vmfkr = KERN_SUCCESS;
