@@ -1,5 +1,41 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## SAPPHIRE 2026-11-24: 0431-0432, a mix of HouseOfBalance's fork on 0430 (branch ci/0431-mezcla)
+
+Commit 53a9103 on ci/0431-mezcla (from ci/0430-venus-power). Kernel built locally on the build Mac
+(~/sapphire-build/dxb2, TOPAZ_4K=1, recipe 4.1b of the lab's OPERACION.md): every patch 0001-0432
+applied (only blacktop's usual four skipped, as in the 0414 build). LC_UUID
+32367451-5FE7-34DC-863F-636ABC1AC5B7. 0429 and 0430 had never been built: their GitHub Actions runs
+failed for lack of macOS runners, not on the code.
+
+Taken from HouseOfBalance/ios-sapphire (forked from Angelpro09xd at 0326; their numbers 0327-0363
+collide with ours, so renumbered):
+- 0431 = their 0363: kern.sweet_qsee op 28 (lock screen unlock by an outside verifier, 2D face
+  unlock) and op 29 (the shared 5-attempt counter q_fod_fails).
+- 0432 = their 0328: the whole 40-row cpufreq LUT, kern.sweet_cpufreq.
+- userland/camera/camd, faceid (faced, SapphireFaceID), fingerprint (Huella, SapphireBiometry,
+  fpd FACE_UNLOCK), tweaks/avcamera, tweaks/nocamera, as of their a05ad44. In the repo, not yet
+  built or installed on the phone.
+Not taken: their 0330 (panel DCS 0x28/0x29/0x51 off by default) and 0361 (brightness half back);
+0360's 180/240 Hz vsync grid (a timer only; lab M36: the panel scans at 120.0 Hz and a 240 grid
+does not raise flips, ~63 flips/s either way); 0329/0359 fence polling (0419-0422 do it by IRQ).
+Also: shim/ from the lab (hwversion/sku/hwc from ABL bootconfig into /chosen, for 0423).
+
+Image: ~/sapphire-build/images/boot-0432-mezcla.img = boot-0414-sched13.img's boot args unchanged
+(... sweetfb_hz=120 sweetsched=13 gpu_vco2=1 sweet_idle_cache=1), new kernel, the lab's shim.
+sha256 77525789...d824. `fastboot boot` only (slot a current), nothing written.
+
+Observed: USB network up 16 s after fastboot boot, SSH; SpringBoard, backboardd, mediaserverd,
+wifid, CommCenter running; kern.uuid matches; kern.sweet_socinfo id 518 (0x206); kern.sweet_cpufreq
+gold state 8 (2803 MHz), silver state 6 (1900 MHz); GPU fence interrupt armed, 1540 interrupts at
+1 min; /chosen sapphire,hwversion 1.49.0, sku n7l, hwc Global. cpu-1-x 69.5 C at 1 min (load 24),
+56-59 C at 2 min. No new crash reports.
+Not checked: Wi-Fi/cellular addresses (no ipconfig/ifconfig in the root's PATH), frame rate,
+heat under long load at 2.8 GHz, battery cost of 0432, face unlock (userland not installed).
+
+Next: build and install the faceid/fingerprint userland and test op 28; measure flips and the
+temperature with 0432 under load (a cap may be needed); check Wi-Fi with tools/net/ifaddrs.
+
 ## SAPPHIRE 2026-11-08: a boot screen instead of the log (shim splash, kernel 0299)
 
 - The shim (`shim/splash.c`) puts a picture on the panel (`shim/splash/splash.png`, converted at build
