@@ -30,11 +30,17 @@ wifid, CommCenter running; kern.uuid matches; kern.sweet_socinfo id 518 (0x206);
 gold state 8 (2803 MHz), silver state 6 (1900 MHz); GPU fence interrupt armed, 1540 interrupts at
 1 min; /chosen sapphire,hwversion 1.49.0, sku n7l, hwc Global. cpu-1-x 69.5 C at 1 min (load 24),
 56-59 C at 2 min. No new crash reports.
-Not checked: Wi-Fi/cellular addresses (no ipconfig/ifconfig in the root's PATH), frame rate,
+Wi-Fi (ring at the end of /dev/rufsroot0: the block device is busy while mounted): BDF
+image/bdn7lmx.bin (hwversion 1.49.0, rule MX, from the new shim); auto-join with no touch, wifid
+SET 20 at 19.7 s, Encuentra_5G 5805 MHz WPA2, auth 0, assoc 0, keys installed, no disconnect in the
+next 5 min. Lab tools/net/ifaddrs: en0 192.168.1.66, pdp_ip0 10.96.61.128. netspeed
+(thinkbroadband, 5 MB on en0): 15.38 Mbit/s; 1.5 MB on pdp_ip0: 6.35 Mbit/s (lab W5 on 2.4 GHz:
+10-12 and 6.3).
+Not checked: frame rate,
 heat under long load at 2.8 GHz, battery cost of 0432, face unlock (userland not installed).
 
 Next: build and install the faceid/fingerprint userland and test op 28; measure flips and the
-temperature with 0432 under load (a cap may be needed); check Wi-Fi with tools/net/ifaddrs.
+temperature with 0432 under load (a cap may be needed); Wi-Fi joins on its own here (W4 had that pending).
 
 ## SAPPHIRE 2026-11-08: a boot screen instead of the log (shim splash, kernel 0299)
 
